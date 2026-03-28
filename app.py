@@ -1229,12 +1229,15 @@ with gr.Blocks(title="Fish Speech S2 Pro - Voice Clone & Training GUI") as app:
             with gr.Row():
                 with gr.Column(scale=1):
                     gr.Markdown("### Voice Sample")
-                    vc_sample_dropdown = gr.Dropdown(
-                        choices=get_sample_choices(),
-                        value=get_sample_choices()[0] if get_sample_choices() else None,
-                        label="Select Sample",
-                        interactive=True
-                    )
+                    with gr.Row():
+                        vc_sample_dropdown = gr.Dropdown(
+                            choices=get_sample_choices(),
+                            value=get_sample_choices()[0] if get_sample_choices() else None,
+                            label="Select Sample",
+                            interactive=True,
+                            scale=10
+                        )
+                        vc_sample_refresh_btn = gr.Button("🔄", scale=1, min_width=50)
                     vc_sample_audio = gr.Audio(label="Sample Preview", type="filepath", interactive=False, elem_id="sample-audio-player")
                     vc_sample_text = gr.Textbox(label="Sample Text", interactive=False, max_lines=10)
                     
@@ -1269,8 +1272,10 @@ with gr.Blocks(title="Fish Speech S2 Pro - Voice Clone & Training GUI") as app:
                         trained_model_dropdown = gr.Dropdown(
                             choices=get_trained_models(),
                             label="Trained LoRA Model",
-                            value="Base Model (Fish S2 Pro)"
+                            value="Base Model (Fish S2 Pro)",
+                            scale=10
                         )
+                        trained_model_refresh_btn = gr.Button("🔄", scale=1, min_width=50)
                         
                     def update_engine_ui(engine):
                         is_cpp = (engine == "Fish Speech S2 Pro (CPP)")
@@ -1306,6 +1311,18 @@ with gr.Blocks(title="Fish Speech S2 Pro - Voice Clone & Training GUI") as app:
                         fn=clone_voice,
                         inputs=[engine_dropdown, cpp_model_dropdown, trained_model_dropdown, target_text, vc_sample_audio, vc_sample_text, top_p_slider, top_k_slider, temperature_slider, rep_pen_slider, split_para_check],
                         outputs=[output_audio, clone_status]
+                    )
+
+                    vc_sample_refresh_btn.click(
+                        fn=lambda: gr.update(choices=get_sample_choices()),
+                        inputs=None,
+                        outputs=[vc_sample_dropdown]
+                    )
+
+                    trained_model_refresh_btn.click(
+                        fn=lambda: gr.update(choices=get_trained_models()),
+                        inputs=None,
+                        outputs=[trained_model_dropdown]
                     )
 
         with gr.Tab("Prep Samples", id="tab_prep_samples"):
