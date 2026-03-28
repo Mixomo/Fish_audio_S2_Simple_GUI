@@ -208,7 +208,7 @@ __marimo__/
 
 # Folders
 
-samples/
-outputs/
-models/
-datasets/
+/samples/
+/outputs/
+/models/
+/datasets/
