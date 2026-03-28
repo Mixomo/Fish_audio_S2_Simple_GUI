@@ -206,7 +206,6 @@ def generate_fish_python(text, ref_audio, ref_text, top_p, top_k, temp, rep_pen,
             torch._inductor.config.triton.unique_kernel_names = True
             torch._inductor.config.fx_graph_cache = True  # Persistent FX graph cache
             torch._inductor.config.max_autotune = True    # Max Autotune mode
-            torch._inductor.config.cache_size_limit = 256 # Keep more cached kernels
             print(f"Inductor cache dir: {COMPILE_CACHE_DIR}")
         
         fish_python_model, fish_python_decode_one_token = init_model(
