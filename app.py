@@ -192,11 +192,18 @@ def generate_fish_python(text, ref_audio, ref_text, top_p, top_k, temp, rep_pen,
         
         progress(0.3, desc="Initializing model...")
         print("Initializing model...")
+        # Set torch compile options for Max Autotune
+        if torch.cuda.is_available():
+            torch._inductor.config.coordinate_descent_tuning = True
+            torch._inductor.config.triton.unique_kernel_names = True
+            torch._inductor.config.fx_graph_cache = True # Speed up repeat recompiles
+            torch._inductor.config.max_autotune = True # Max Autotune mode
+        
         fish_python_model, fish_python_decode_one_token = init_model(
             checkpoint_path=fish_python_checkpoint_dir,
             device=device,
             precision=precision,
-            compile=False,
+            compile=True, # Enable torch.compile
         )
 
 
@@ -263,7 +270,7 @@ def generate_fish_python(text, ref_audio, ref_text, top_p, top_k, temp, rep_pen,
                     top_k=top_k,
                     temperature=temp,
                     repetition_penalty=rep_pen,
-                    compile=False,
+                    compile=True, # Enable torch.compile
                     iterative_prompt=True,
                     chunk_length=200,
                     prompt_text=[ref_text] if ref_text else None,
@@ -310,7 +317,7 @@ def generate_fish_python(text, ref_audio, ref_text, top_p, top_k, temp, rep_pen,
                 top_k=top_k,
                 temperature=temp,
                 repetition_penalty=rep_pen,
-                compile=False,
+                compile=True, # Enable torch.compile
                 iterative_prompt=True,
                 chunk_length=200,
                 prompt_text=[ref_text] if ref_text else None,
