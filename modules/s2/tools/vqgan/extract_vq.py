@@ -64,11 +64,9 @@ def get_model(
         cfg = compose(config_name=config_name)
 
     model = instantiate(cfg)
-    device = torch.device(device)
     state_dict = torch.load(
         checkpoint_path,
         map_location=device,
-        weights_only=True
     )
     if "state_dict" in state_dict:
         state_dict = state_dict["state_dict"]
@@ -152,7 +150,6 @@ def process_batch(files: list[Path], model) -> float:
 )
 @click.option("--batch-size", default=64)
 @click.option("--filelist", default=None, type=Path)
-@click.option("--device", default="cuda")
 def main(
     folder: str,
     num_workers: int,
@@ -160,14 +157,13 @@ def main(
     checkpoint_path: str,
     batch_size: int,
     filelist: Path,
-    device: str,
 ):
     if num_workers > 1 and WORLD_SIZE != num_workers:
         assert WORLD_SIZE == 1, "You should either use SLURM or this launcher, not both"
 
         logger.info(f"Spawning {num_workers} workers")
 
-        if device == "cuda" and torch.cuda.is_available():
+        if torch.cuda.is_available():
             visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", None)
             if visible_devices is None:
                 visible_devices = list(range(torch.cuda.device_count()))
@@ -215,12 +211,7 @@ def main(
     total_time = 0
     begin_time = time.time()
     processed_files = 0
-    
-    if device == "cuda" and not torch.cuda.is_available():
-        logger.warning("CUDA is not available, falling back to CPU")
-        device = "cpu"
-        
-    model = get_model(config_name, checkpoint_path, device=device)
+    model = get_model(config_name, checkpoint_path)
 
     for n_batch, idx in enumerate(range(0, len(files), batch_size)):
         batch = files[idx : idx + batch_size]

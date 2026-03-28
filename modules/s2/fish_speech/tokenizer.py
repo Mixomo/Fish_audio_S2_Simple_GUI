@@ -126,6 +126,4 @@ class FishTokenizer:
         return cls(path)
 
     def __getattr__(self, name):
-        if name.startswith("_"):
-            raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
         return getattr(self._tokenizer, name)

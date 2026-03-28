@@ -4,17 +4,17 @@ defaults:
 
 project: text2semantic_finetune_dual_ar
 max_length: 4096
-pretrained_ckpt_path: checkpoints/s2-pro
+pretrained_ckpt_path: checkpoints/openaudio-s1-mini
 
 # Lightning Trainer
 trainer:
-  accumulate_grad_batches: 4
+  accumulate_grad_batches: 1
   gradient_clip_val: 1.0
   gradient_clip_algorithm: "norm"
-  max_steps: 400
+  max_steps: 10000
   precision: bf16-true
   limit_val_batches: 10
-  val_check_interval: 50
+  val_check_interval: 100
   # strategy:
   #   find_unused_parameters: true
   #   static_graph: true 
@@ -30,27 +30,27 @@ train_dataset:
   proto_files:
     - data/protos
   tokenizer: ${tokenizer}
-  causal: false
+  causal: true
   max_length: ${max_length}
   use_speaker: false
-  interactive_prob: 1.0
+  interactive_prob: 0.7
 
 val_dataset:
   _target_: fish_speech.datasets.semantic.AutoTextSemanticInstructionIterableDataset
   proto_files:
     - data/protos
   tokenizer: ${tokenizer}
-  causal: false
+  causal: true
   max_length: ${max_length}
   use_speaker: false
-  interactive_prob: 1.0
+  interactive_prob: 0.7
 
 data:
   _target_: fish_speech.datasets.semantic.SemanticDataModule
   train_dataset: ${train_dataset}
   val_dataset: ${val_dataset}
   num_workers: 4
-  batch_size: 1
+  batch_size: 4
   tokenizer: ${tokenizer}
   max_length: ${max_length}
 
@@ -67,25 +67,20 @@ model:
   optimizer:
     _target_: torch.optim.AdamW
     _partial_: true
-    lr: 1e-5
-    weight_decay: 0.01
+    lr: 1e-4
+    weight_decay: 0
     betas: [0.9, 0.95]
     eps: 1e-5
 
   lr_scheduler:
-    _target_: torch.optim.lr_scheduler.CosineAnnealingLR
+    _target_: torch.optim.lr_scheduler.LambdaLR
     _partial_: true
-    T_max: 400
-    eta_min: 1e-6
+    lr_lambda:
+      _target_: fish_speech.scheduler.get_constant_schedule_with_warmup_lr_lambda
+      _partial_: true
+      num_warmup_steps: 10
 
 # Callbacks
 callbacks:
   model_checkpoint:
-    every_n_train_steps: 100
-  audio_sample:
-    _target_: fish_speech.callbacks.AudioSampleCallback
-    text: "This is a sample text to monitor the voice during training."
-    codec_checkpoint_path: ${pretrained_ckpt_path}/codec.pth
-    reference_audio_path: null
-    reference_text: null
-    audio_format: mp3
+    every_n_train_steps: ${trainer.val_check_interval}

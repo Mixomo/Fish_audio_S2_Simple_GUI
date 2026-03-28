@@ -12,26 +12,48 @@ import soundfile as sf
 import numpy as np
 import glob
 import yaml
-import winsound
+if os.name == 'nt':
+    import winsound
+else:
+    winsound = None
+
 
 # Audio Chime Path
 CHIME_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "inference_training_done.wav")
 
 def play_done_chime():
-    if os.path.exists(CHIME_PATH):
-        try:
-            winsound.PlaySound(CHIME_PATH, winsound.SND_FILENAME | winsound.SND_ASYNC)
-        except Exception as e:
-            print(f"Failed to play chime: {e}")
-    else:
-        # Fallback to system beep if file is missing
-        winsound.MessageBeep()
+    if not os.path.exists(CHIME_PATH):
+        if os.name != 'nt': print("\a", end="")
+        return
+
+    try:
+        import shutil
+        # Try common Linux audio players in order
+        players = [
+            ["pw-play", CHIME_PATH],
+            ["paplay", CHIME_PATH],
+            ["aplay", CHIME_PATH],
+            ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", CHIME_PATH],
+        ]
+        for player_cmd in players:
+            if shutil.which(player_cmd[0]):
+                subprocess.Popen(player_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                return
+        
+        if os.name != 'nt': print("\a", end="") # Terminal bell fallback
+    except Exception as e:
+        print(f"Failed to play chime: {e}")
+
 
 # Main Paths
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 CPP_EXEC = os.path.join(ROOT_DIR, "modules", "s2.cpp", "build", "Release", "s2.exe")
 if not os.path.exists(CPP_EXEC):
     CPP_EXEC = os.path.join(ROOT_DIR, "modules", "s2.cpp", "build", "s2.exe")
+# Linux Fallback
+if not os.path.exists(CPP_EXEC):
+    CPP_EXEC = os.path.join(ROOT_DIR, "modules", "s2.cpp", "build", "s2")
+
 TOKENIZER_PATH = os.path.join(ROOT_DIR, "modules", "s2.cpp", "tokenizer.json")
 
 s2_process = None
@@ -68,11 +90,11 @@ os.makedirs(TRAINING_DATA_DIR, exist_ok=True)
 GGUF_MODELS = {
     "F16 [CUDA] (>12GB VRAM) ~14GB Studio Quality": "s2-pro-f16.gguf",
     "Q8_0 [CUDA] (≥8GB VRAM) ~8GB Best Balance": "s2-pro-q8_0.gguf",
-    "Q6_K [Vulkan] (6-8GB VRAM) ~6GB Good Quality": "s2-pro-q6_k.gguf",
-    "Q5_K_M [Vulkan] (4-6GB VRAM) ~5GB Balanced": "s2-pro-q5_k_m.gguf",
-    "Q4_K_M [Vulkan/CPU] (3-4GB VRAM) ~4GB Decent": "s2-pro-q4_k_m.gguf",
-    "Q3_K [Vulkan/CPU] ~3GB Low Quality": "s2-pro-q3_k.gguf",
-    "Q2_K [Vulkan/CPU] <3GB Very Low Quality": "s2-pro-q2_k.gguf"
+    "Q6_K [Vulkan - Not Supported under WSL2] (6-8GB VRAM) ~6GB Good Quality": "s2-pro-q6_k.gguf",
+    "Q5_K_M [Vulkan - Not Supported under WSL2] (4-6GB VRAM) ~5GB Balanced": "s2-pro-q5_k_m.gguf",
+    "Q4_K_M [Vulkan/CPU - Not Supported under WSL2] (3-4GB VRAM) ~4GB Decent": "s2-pro-q4_k_m.gguf",
+    "Q3_K [Vulkan/CPU - Not Supported under WSL2] ~3GB Low Quality": "s2-pro-q3_k.gguf",
+    "Q2_K [Vulkan/CPU - Not Supported under WSL2] <3GB Very Low Quality": "s2-pro-q2_k.gguf"
 }
 # GPU backend selection:
 #   F16, Q8_0       -> CUDA (-c 0) — native CUDA get_rows support
@@ -170,12 +192,21 @@ def generate_fish_python(text, ref_audio, ref_text, top_p, top_k, temp, rep_pen,
         
         progress(0.3, desc="Initializing model...")
         print("Initializing model...")
+        # Set torch compile options for Max Autotune (User Requirement)
+        if torch.cuda.is_available():
+            torch._inductor.config.coordinate_descent_tuning = True
+            torch._inductor.config.triton.unique_kernel_names = True
+            torch._inductor.config.fx_graph_cache = True # Speed up repeat recompiles
+            torch._inductor.config.max_autotune = True # Max Autotune mode
+        
         fish_python_model, fish_python_decode_one_token = init_model(
             checkpoint_path=fish_python_checkpoint_dir,
             device=device,
             precision=precision,
-            compile=False,
+            compile=True, # Enable torch.compile
         )
+
+
             
         progress(0.5, desc="Initializing codec...")
         print("Initializing codec...")
@@ -239,7 +270,8 @@ def generate_fish_python(text, ref_audio, ref_text, top_p, top_k, temp, rep_pen,
                     top_k=top_k,
                     temperature=temp,
                     repetition_penalty=rep_pen,
-                    compile=False,
+                    compile=True, # Enable torch.compile
+
                     iterative_prompt=True,
                     chunk_length=200,
                     prompt_text=[ref_text] if ref_text else None,
@@ -286,7 +318,8 @@ def generate_fish_python(text, ref_audio, ref_text, top_p, top_k, temp, rep_pen,
                 top_k=top_k,
                 temperature=temp,
                 repetition_penalty=rep_pen,
-                compile=False,
+                compile=True, # Enable torch.compile
+
                 iterative_prompt=True,
                 chunk_length=200,
                 prompt_text=[ref_text] if ref_text else None,
@@ -408,16 +441,24 @@ def clone_voice(engine, cpp_model_str, trained_model_select, text, ref_audio, re
                 
             # 3. Robustly scan for ALL installed CUDA Toolkit versions (for any user)
             import glob
-            default_cuda_base = r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA"
-            if os.path.exists(default_cuda_base):
-                # Find all "vX.X" directories and sort them (highest version first)
-                found_versions = glob.glob(os.path.join(default_cuda_base, "v*"))
-                for v_dir in sorted(found_versions, reverse=True):
-                    # Check both standard bin and bin/x64 (common in CUDA 13/lib)
-                    for sub in ["bin", os.path.join("bin", "x64")]:
-                        bin_path = os.path.join(v_dir, sub)
-                        if os.path.exists(bin_path):
-                            extra_paths.append(bin_path)
+            if os.name == 'nt':
+                default_cuda_base = r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA"
+                if os.path.exists(default_cuda_base):
+                    # Find all "vX.X" directories and sort them (highest version first)
+                    found_versions = glob.glob(os.path.join(default_cuda_base, "v*"))
+                    for v_dir in sorted(found_versions, reverse=True):
+                        # Check both standard bin and bin/x64 (common in CUDA 13/lib)
+                        for sub in ["bin", os.path.join("bin", "x64")]:
+                            bin_path = os.path.join(v_dir, sub)
+                            if os.path.exists(bin_path):
+                                extra_paths.append(bin_path)
+            else:
+                # Standard Linux CUDA paths
+                linux_paths = ["/usr/local/cuda/bin", "/usr/bin"]
+                for lp in linux_paths:
+                    if os.path.exists(lp):
+                        extra_paths.append(lp)
+
 
             # 4. Construct the new PATH (prioritize our detected CUDA paths)
             new_path_str = os.pathsep.join(list(dict.fromkeys(extra_paths))) # Remove duplicates
@@ -876,13 +917,15 @@ def run_training_step(cmd, desc, progress):
     # Run from FS_DIR to ensure hydra and relative paths work
     process = subprocess.Popen(
         cmd,
-        cwd=FS_DIR if "python " in cmd else ROOT_DIR,
+        cwd=FS_DIR if ("python" in cmd.lower() or sys.executable in cmd) else ROOT_DIR,
+
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
         bufsize=1,
-        shell=True if os.name == 'nt' else False
+        shell=True # Enable shell for string commands on all platforms
     )
+
     
     logs = []
     for line in iter(process.stdout.readline, ""):
@@ -922,7 +965,9 @@ def handle_lora_vq_extraction(output_name, progress=gr.Progress()):
         from huggingface_hub import hf_hub_download
         hf_hub_download(repo_id="fishaudio/s2-pro", filename="codec.pth", local_dir=FISH_MODELS_DIR)
 
-    cmd = f"uv run python tools/vqgan/extract_vq.py \"{data_dir}\" --config-name modded_dac_vq --checkpoint-path \"{codec_path}\" --num-workers 1 --batch-size 1"
+    import sys
+    cmd = f'"{sys.executable}" tools/vqgan/extract_vq.py "{data_dir}" --config-name modded_dac_vq --checkpoint-path "{codec_path}" --num-workers 1 --batch-size 1'
+
     success, msg = run_training_step(cmd, "VQ Extraction", progress)
     return msg
 
@@ -931,7 +976,9 @@ def handle_lora_sharding(output_name, progress=gr.Progress()):
     proto_dir = os.path.join(data_dir, "protos")
     os.makedirs(proto_dir, exist_ok=True)
     
-    cmd = f"uv run python tools/llama/build_dataset.py --input \"{data_dir}\" --output \"{proto_dir}\" --text-extension .lab --num-workers 4"
+    import sys
+    cmd = f'"{sys.executable}" tools/llama/build_dataset.py --input "{data_dir}" --output "{proto_dir}" --text-extension .lab --num-workers 4'
+
     success, msg = run_training_step(cmd, "Sharding", progress)
     return msg
 
@@ -954,14 +1001,16 @@ def handle_lora_train(output_name, model_name, max_steps, lr, progress=gr.Progre
     proto_dir_abs = os.path.abspath(proto_dir).replace("\\", "/")
     ckpt_dir_abs = os.path.abspath(FISH_MODELS_DIR).replace("\\", "/")
     
+    import sys
+    env_setter = "set" if os.name == 'nt' else "export"
     cmd = (
-        f"set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True && "
-        f"uv run python fish_speech/train.py "
+        f"{env_setter} PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True && "
+        f'"{sys.executable}" fish_speech/train.py '
+
         f"--config-name text2semantic_finetune "
         f"project={model_name} "
         f"+lora@model.model.lora_config=r_32_alpha_16_fast "
         f"trainer.max_steps={max_steps} "
-        f"model.lr_scheduler.T_max={max_steps} "
         f"model.optimizer.lr={lr} "
         f"trainer.strategy=auto "
         f"trainer.devices=1 "
@@ -1043,14 +1092,14 @@ def handle_lora_unified(output_name, model_name, max_steps, lr, vram_preset, lor
         
     ckpt_dir_save = os.path.abspath(os.path.join(FS_DIR, "results", model_name, "checkpoints")).replace("\\", "/")
 
+    env_setter = "set" if os.name == 'nt' else "export"
     cmd = (
-        f"set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True && "
-        f"uv run python fish_speech/train.py "
+        f"{env_setter} PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True && "
+        f'"{sys.executable}" fish_speech/train.py '
         f"--config-name text2semantic_finetune "
         f"project={model_name} "
         f"+lora@model.model.lora_config={lora_config_name} "
         f"trainer.max_steps={int(max_steps)} "
-        f"model.lr_scheduler.T_max={int(max_steps)} "
         f"trainer.accumulate_grad_batches={acc_grad} "
         f"data.batch_size={bs} "
         f"model.optimizer.lr={float(lr)} "
@@ -1060,7 +1109,6 @@ def handle_lora_unified(output_name, model_name, max_steps, lr, vram_preset, lor
         f"pretrained_ckpt_path=\"{ckpt_dir_abs}\" "
         f"train_dataset.proto_files=[{proto_dir_abs}] "
         f"val_dataset.proto_files=[{proto_dir_abs}] "
-        f"~callbacks.audio_sample "
         f"callbacks.model_checkpoint.dirpath=\"{ckpt_dir_save}\" "
         f"callbacks.model_checkpoint.every_n_train_steps=50 "
         f"callbacks.model_checkpoint.save_last=True"
@@ -1369,7 +1417,7 @@ with gr.Blocks(title="Fish Speech S2 Pro - Voice Clone & Training GUI") as app:
                         with gr.Tab("Dataset Creation"):
                             gr.Markdown("### 📂 Dataset Creation for Training")
                             with gr.Row():
-                                batch_folder_input = gr.Textbox(label="Source Audio Folder", placeholder="C:\\path\\to\\your\\audio\\files", scale=4)
+                                batch_folder_input = gr.Textbox(label="Source Audio Folder", placeholder="path/to/your/audio/files", scale=4)
                                 
                                 explorer_btn = gr.Button("📂 Browse", size="sm", scale=1)
                                 def open_folder_explorer():
