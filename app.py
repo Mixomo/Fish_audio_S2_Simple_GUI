@@ -74,8 +74,16 @@ WHISPER_MODELS_DIR = os.path.join(MODELS_DIR, "whisper")
 OUTPUTS_DIR = os.path.join(ROOT_DIR, "outputs")
 SAMPLES_DIR = os.path.join(ROOT_DIR, "samples")
 
-for d in [OUTPUTS_DIR, MODELS_DIR, FISH_MODELS_DIR, S2_CPP_MODELS_DIR, SAMPLES_DIR, TRAINED_MODELS_DIR, WHISPER_MODELS_DIR]:
+# Persistent torch.compile / Inductor cache (avoids re-autotuning on every launch)
+COMPILE_CACHE_DIR = os.path.join(ROOT_DIR, ".cache", "torch_compile")
+
+for d in [OUTPUTS_DIR, MODELS_DIR, FISH_MODELS_DIR, S2_CPP_MODELS_DIR, SAMPLES_DIR, TRAINED_MODELS_DIR, WHISPER_MODELS_DIR, COMPILE_CACHE_DIR]:
     os.makedirs(d, exist_ok=True)
+
+# Set env vars BEFORE any torch.compile call to enable persistent kernel caching
+os.environ["TORCHINDUCTOR_CACHE_DIR"] = COMPILE_CACHE_DIR
+os.environ["TORCHINDUCTOR_FX_GRAPH_CACHE"] = "1"
+os.environ["TORCH_LOGS"] = os.environ.get("TORCH_LOGS", "")  # Preserve existing logs config
 
 import sys
 if os.path.join(ROOT_DIR, "modules", "s2") not in sys.path:
@@ -190,14 +198,16 @@ def generate_fish_python(text, ref_audio, ref_text, top_p, top_k, temp, rep_pen,
         device = "cuda" if torch.cuda.is_available() else "cpu"
         precision = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
         
-        progress(0.3, desc="Initializing model...")
+        progress(0.3, desc="Initializing model (first launch compiles & caches kernels)...")
         print("Initializing model...")
-        # Set torch compile options for Max Autotune
+        # Torch compile + Inductor settings with persistent cache
         if torch.cuda.is_available():
             torch._inductor.config.coordinate_descent_tuning = True
             torch._inductor.config.triton.unique_kernel_names = True
-            torch._inductor.config.fx_graph_cache = True # Speed up repeat recompiles
-            torch._inductor.config.max_autotune = True # Max Autotune mode
+            torch._inductor.config.fx_graph_cache = True  # Persistent FX graph cache
+            torch._inductor.config.max_autotune = True    # Max Autotune mode
+            torch._inductor.config.cache_size_limit = 256 # Keep more cached kernels
+            print(f"Inductor cache dir: {COMPILE_CACHE_DIR}")
         
         fish_python_model, fish_python_decode_one_token = init_model(
             checkpoint_path=fish_python_checkpoint_dir,
