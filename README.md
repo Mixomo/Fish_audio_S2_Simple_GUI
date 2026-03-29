@@ -2,6 +2,13 @@
 
 A comprehensive, all-in-one Graphical User Interface (GUI) for **Fish Speech S2 Pro**. This project streamlines the process of voice cloning, dataset preparation, and LoRA training, providing a robust and optimized experience on Windows with full GPU acceleration.
 
+### 🚀 2026-03-29 - Windows Performance Breakthrough
+We have successfully achieved **Linux-level inference speeds on Windows** through several major architectural optimizations:
+*   **Ninja + MSVC Integration**: Transitioned to the **Ninja build system** and **Visual Studio 2022** with high-performance compiler flags (`/Ox`, `/arch:AVX2`, `/LTCG`) for an ultra-optimized C++ and Pytroch inference engines.
+*   **OpenMP Parallelization**: The CPU-bound audio codec (DAC) is now fully multithreaded, leveraging all available cores for rapid audio generation.
+*   **Hybrid Core Affinity**: Intelligent thread management tailored for **Intel 12th/13th/14th Gen (P-cores/E-cores)** and **AMD Ryzen**, pinning compute-heavy tasks to the fastest physical cores.
+*   **Persistent Torch Cache & Triton (Pytorch Engine)**: Integration of `triton-windows` and a custom kernel caching system in `models/.cache`, enabling the full power of `torch.compile` (`max-autotune`) with near-instant startups.
+
 ## Key Features
 
 ### 🔊 High-Performance Voice Cloning

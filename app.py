@@ -34,6 +34,12 @@ if not os.path.exists(CPP_EXEC):
     CPP_EXEC = os.path.join(ROOT_DIR, "modules", "s2.cpp", "build", "s2.exe")
 TOKENIZER_PATH = os.path.join(ROOT_DIR, "modules", "s2.cpp", "tokenizer.json")
 
+# Performance Optimizations for OpenMP (Threading Affinity)
+os.environ["OMP_PROC_BIND"] = "TRUE"
+os.environ["OMP_PLACES"] = "CORES"
+os.environ["OMP_WAIT_POLICY"] = "PASSIVE"
+os.environ["KMP_BLOCKTIME"] = "0"
+
 s2_process = None
 s2_current_model = None
 
@@ -54,6 +60,15 @@ SAMPLES_DIR = os.path.join(ROOT_DIR, "samples")
 
 for d in [OUTPUTS_DIR, MODELS_DIR, FISH_MODELS_DIR, S2_CPP_MODELS_DIR, SAMPLES_DIR, TRAINED_MODELS_DIR, WHISPER_MODELS_DIR]:
     os.makedirs(d, exist_ok=True)
+
+# Persistent Cache for torch.compile (Inductor / Triton)
+# This prevents recompilation on every restart
+CACHE_DIR = os.path.join(MODELS_DIR, ".cache")
+os.makedirs(CACHE_DIR, exist_ok=True)
+os.environ["TORCHINDUCTOR_CACHE_DIR"] = CACHE_DIR
+os.environ["TRITON_CACHE_DIR"] = CACHE_DIR
+# Optimization flag to cache FX graphs
+os.environ["TORCHINDUCTOR_FX_GRAPH_CACHE"] = "1"
 
 import sys
 if os.path.join(ROOT_DIR, "modules", "s2") not in sys.path:
@@ -176,8 +191,43 @@ def generate_fish_python(text, ref_audio, ref_text, top_p, top_k, temp, rep_pen,
             precision=precision,
             compile=False,
         )
+
+        if device == "cuda":
+            # Check for existing cache to provide feedback
+            has_cache = False
+            try:
+                if os.path.exists(CACHE_DIR) and any(os.scandir(CACHE_DIR)):
+                    has_cache = True
+            except: pass
+
+            msg = "Speed-up inference activated (Using cached kernels)..." if has_cache else "Optimizing model (torch.compile)..."
+            if has_cache: print(f"🚀 {msg}")
             
-        progress(0.5, desc="Initializing codec...")
+            progress(0.4, desc=msg)
+            try:
+                print(f"Attempting torch.compile with mode='max-autotune' (Cache: {'Found' if has_cache else 'None'})...")
+                fish_python_decode_one_token = torch.compile(
+                    fish_python_decode_one_token, 
+                    mode="max-autotune",
+                    fullgraph=True
+                )
+                if has_cache:
+                    print("Optimization level: max-autotune (Rapid start from cache)")
+                else:
+                    print("Optimization level: max-autotune (Wait for first inference to finish compilation)")
+            except Exception as e:
+                print(f"max-autotune is not supported on this environment: {e}. Falling back to 'reduce-overhead'...")
+                try:
+                    fish_python_decode_one_token = torch.compile(
+                        fish_python_decode_one_token, 
+                        mode="reduce-overhead",
+                        fullgraph=True
+                    )
+                    print("Optimization level: reduce-overhead")
+                except Exception as e2:
+                    print(f"reduce-overhead also failed: {e2}. Proceeding without torch.compile.")
+        
+        progress(0.45, desc="Initializing codec...")
         print("Initializing codec...")
         fish_dir = Path(os.path.join(ROOT_DIR, "modules", "s2"))
         codec_cfg = OmegaConf.load(fish_dir / "fish_speech" / "configs" / "modded_dac_vq.yaml")
@@ -371,27 +421,26 @@ def clone_voice(engine, cpp_model_str, trained_model_select, text, ref_audio, re
                 time.sleep(1.5)  # Wait for Windows TIME_WAIT to release port 3030
                 
             progress(0.3, desc="Starting Fish CPP Server...")
-            # Use physical cores only (not logical/HT) for better GGUF performance
+            # Optimized thread count for modern CPUs (P-cores/E-cores and high core counts)
+            # Use physical cores if available (psutil), otherwise logical/2 for efficiency.
             try:
                 import psutil
-                cpu_physical = psutil.cpu_count(logical=False) or os.cpu_count() or 4
-            except ImportError:
-                cpu_physical = os.cpu_count() or 4
-            # Use all physical cores for inference threads; batch threads = same
-            cpu_total = cpu_physical
+                threads = psutil.cpu_count(logical=False) or (os.cpu_count() // 2) or 4
+            except:
+                threads = (os.cpu_count() // 2) if (os.cpu_count() and os.cpu_count() > 8) else (os.cpu_count() or 4)
+
             cmd = [
                 CPP_EXEC,
-                "--model", model_path,
-                "--tokenizer", TOKENIZER_PATH,
+                "-m", model_path,
+                "-t", TOKENIZER_PATH,
                 "--server",
-                "--threads", str(cpu_total),
-                "--threads-batch", str(cpu_total),
+                "-threads", str(threads),
             ]
             if "CPU ONLY" not in cpp_model_str:
                 if filename in CUDA_NATIVE_MODELS:
                     cmd.extend(["-c", "0"])  # CUDA for F16/Q8_0
                 else:
-                    cmd.extend(["-v", "0"])  # Vulkan for k-quants (Q6_K, Q5_K_M, Q4_K_M)
+                    cmd.extend(["-v", "0"])  # Vulkan for k-quants
 
             # Fix PATH correctly for s2.exe to find cublas64_##.dll
             env = os.environ.copy()

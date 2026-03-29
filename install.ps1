@@ -29,6 +29,28 @@ if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
 }
 
 # -------------------------------------------------------
+# Ninja (winget)
+# -------------------------------------------------------
+if (-not (Get-Command ninja -ErrorAction SilentlyContinue) -and (Get-Command winget -ErrorAction SilentlyContinue)) {
+    Write-Header "Installing Ninja (via winget)"
+    try {
+        winget install --id Ninja-build.Ninja --exact --silent --accept-source-agreements --accept-package-agreements
+        # Refresh Path for current session
+        $env:PATH = [System.Environment]::GetEnvironmentVariable("Path", "User") + ";" + [System.Environment]::GetEnvironmentVariable("Path", "Machine")
+    } catch {
+        Write-Warn "Winget failed to install Ninja. Please install it manually from https://ninja-build.org/"
+    }
+}
+
+if (Get-Command ninja -ErrorAction SilentlyContinue) {
+    Write-Ok "Ninja is ready. Setting CMAKE_GENERATOR=Ninja for all compilations."
+    $env:CMAKE_GENERATOR = "Ninja"
+    $env:CMAKE_MAKE_PROGRAM = (Get-Command ninja).Source
+} else {
+    Write-Warn "Ninja not found. Falling back to default generators."
+}
+
+# -------------------------------------------------------
 # Virtual Environment
 # -------------------------------------------------------
 Write-Header "Creating Virtual Environment (Python 3.10)"
@@ -215,15 +237,21 @@ if (-not $cudaToolkitPath -and -not (Get-Command nvcc -ErrorAction SilentlyConti
             New-Item -ItemType Directory "build" | Out-Null
             $buildDir = (Resolve-Path "build").Path
 
-            $useNinja = [bool](Get-Command ninja -ErrorAction SilentlyContinue)
-            $generator = if ($useNinja) { "Ninja" } else { "Visual Studio 17 2022" }
-            Write-Ok "Generator: $generator"
+            $useNinja = (Get-Command ninja -ErrorAction SilentlyContinue)
+            if ($useNinja) {
+                $generator = "Ninja"
+                Write-Ok "Generator: Ninja (Priority)"
+            } else {
+                $generator = "Visual Studio 17 2022"
+                Write-Ok "Generator: Visual Studio 17 2022 (Fallback)"
+            }
 
             Write-Info "Configuring..."
             # CUDA backend only supports F16/Q8_0 for get_rows.
             # Vulkan backend supports ALL quantizations including k-quants.
             # Enable both backends so the runtime picks the best one.
-            $cudaArgs = "-DS2_CUDA=ON -DCMAKE_BUILD_TYPE=Release"
+            # Performance flags: /Ox (max opt), /arch:AVX2 (SIMD), /fp:fast, /GL /LTCG (Link Time Optimization), /openmp (Multithreading)
+            $cudaArgs = "-DS2_CUDA=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS=`"/Ox /arch:AVX2 /fp:fast /GL /DNDEBUG /openmp`" -DCMAKE_EXE_LINKER_FLAGS=`"/LTCG`" -DCMAKE_STATIC_LINKER_FLAGS=`"/LTCG`""
             
             # Check for Vulkan SDK
             $vulkanSdk = $env:VULKAN_SDK
@@ -266,7 +294,7 @@ if (-not $cudaToolkitPath -and -not (Get-Command nvcc -ErrorAction SilentlyConti
 # Extra deps
 # -------------------------------------------------------
 Write-Header "Installing additional dependencies"
-uv pip install soundfile librosa numpy "pydantic>=2.0" faster-whisper ctranslate2 huggingface_hub hf-xet loralib gradio loguru transformers datasets lightning hydra-core tensorboard natsort einops rich wandb grpcio kui uvicorn pyrootutils resampy einx zstandard pydub pyaudio modelscope opencc-python-reimplemented silero-vad ormsgpack tiktoken cachetools descript-audio-codec safetensors google-genai deepgram-sdk pyannote.audio
+uv pip install soundfile librosa numpy "pydantic>=2.0" faster-whisper ctranslate2 huggingface_hub hf-xet loralib gradio loguru transformers datasets lightning hydra-core tensorboard natsort einops rich wandb grpcio kui uvicorn pyrootutils resampy einx zstandard pydub pyaudio modelscope opencc-python-reimplemented silero-vad ormsgpack tiktoken cachetools descript-audio-codec safetensors google-genai deepgram-sdk pyannote.audio triton-windows
 
 # -------------------------------------------------------
 # Verify

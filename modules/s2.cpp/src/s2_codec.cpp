@@ -16,6 +16,9 @@
 #include <cstdio>
 #include <limits>
 #include <stdexcept>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 namespace s2 {
 
@@ -582,6 +585,9 @@ static void quantize_with_vq(const vq_cache & vq, const std::vector<float> & inp
     codes.resize(frames);
     projected_out.assign(static_cast<size_t>(frames) * vq.input_dim, 0.0f);
 
+    #ifdef _OPENMP
+    #pragma omp parallel for
+    #endif
     for (int32_t t = 0; t < frames; ++t) {
         const float * lat = latents.data() + static_cast<size_t>(t) * vq.codebook_dim;
         float lat_norm = 0.0f;
@@ -612,6 +618,9 @@ static void quantize_with_vq(const vq_cache & vq, const std::vector<float> & inp
 
 static void dequantize_one_vq(const vq_cache & vq, const int32_t * codes, int32_t frames,
                                std::vector<float> & accum) {
+    #ifdef _OPENMP
+    #pragma omp parallel for
+    #endif
     for (int32_t t = 0; t < frames; ++t) {
         int32_t code = codes[t];
         if (code < 0) code = 0;
