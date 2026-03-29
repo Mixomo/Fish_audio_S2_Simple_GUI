@@ -2,6 +2,13 @@
 
 A comprehensive, all-in-one Graphical User Interface (GUI) for **Fish Speech S2 Pro**. This project streamlines the process of voice cloning, dataset preparation, and LoRA training, providing a robust and optimized experience on **Linux / WSL** with full GPU acceleration.
 
+### 🚀 2026-03-29 - Power Optimizations (Linux/WSL)
+The project now features high-performance improvements for Linux/WSL platforms:
+*   **Ninja + GCC/Clang Build Optimization**: Faster and more efficient C++ builds using the **Ninja** build system and **GCC/Clang** with high-performance flags (`-O3`, `-march=native`, `-ffast-math`).
+*   **OpenMP Multithreaded Engine**: The audio codec (DAC) is now fully multithreaded using **OpenMP**, utilizing all available CPU cores for audio generation.
+*   **Advanced Thread Affinity**: Intelligent CPU thread management using `OMP_PROC_BIND` and `OMP_PLACES`, tailored for **Intel Hybrid 12th/13th/14th Gen (P-cores/E-cores)** and **AMD Ryzen**.
+*   **Persistent Torch Cache**: Implementation of `TORCHINDUCTOR_CACHE_DIR` and `TRITON_CACHE_DIR` to cache optimized kernels in `models/.cache`, bringing near-instant inference startups to Linux.
+
 ## Key Features
 
 ### 🔊 High-Performance Voice Cloning

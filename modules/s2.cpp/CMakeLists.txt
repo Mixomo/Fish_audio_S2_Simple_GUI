@@ -61,6 +61,11 @@ target_include_directories(s2 PRIVATE
 
 target_link_libraries(s2 PRIVATE ggml)
 
+find_package(OpenMP)
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(s2 PUBLIC OpenMP::OpenMP_CXX)
+endif()
+
 if(S2_VULKAN)
     target_compile_definitions(s2 PRIVATE GGML_USE_VULKAN)
 endif()

@@ -56,6 +56,21 @@ if not os.path.exists(CPP_EXEC):
 
 TOKENIZER_PATH = os.path.join(ROOT_DIR, "modules", "s2.cpp", "tokenizer.json")
 
+# Performance Optimizations for OpenMP (Threading Affinity)
+os.environ["OMP_PROC_BIND"] = "TRUE"
+os.environ["OMP_PLACES"] = "CORES"
+os.environ["OMP_WAIT_POLICY"] = "PASSIVE"
+os.environ["KMP_BLOCKTIME"] = "0"
+
+# Persistent Cache for torch.compile (Inductor / Triton)
+# This prevents recompilation on every restart
+MODELS_DIR = os.path.join(ROOT_DIR, "models")
+CACHE_DIR = os.path.join(MODELS_DIR, ".cache")
+os.makedirs(CACHE_DIR, exist_ok=True)
+os.environ["TORCHINDUCTOR_CACHE_DIR"] = CACHE_DIR
+os.environ["TRITON_CACHE_DIR"] = CACHE_DIR
+os.environ["TORCHINDUCTOR_FX_GRAPH_CACHE"] = "1"
+
 s2_process = None
 s2_current_model = None
 
@@ -411,21 +426,20 @@ def clone_voice(engine, cpp_model_str, trained_model_select, text, ref_audio, re
                 time.sleep(1.5)  # Wait for Windows TIME_WAIT to release port 3030
                 
             progress(0.3, desc="Starting Fish CPP Server...")
-            # Use physical cores only (not logical/HT) for better GGUF performance
+            # Optimized thread count for modern CPUs (P-cores/E-cores and high core counts)
+            # Use physical cores if available (psutil), otherwise logical/2 for efficiency.
             try:
                 import psutil
-                cpu_physical = psutil.cpu_count(logical=False) or os.cpu_count() or 4
-            except ImportError:
-                cpu_physical = os.cpu_count() or 4
-            # Use all physical cores for inference threads; batch threads = same
-            cpu_total = cpu_physical
+                threads = psutil.cpu_count(logical=False) or (os.cpu_count() // 2) or 4
+            except:
+                threads = (os.cpu_count() // 2) if (os.cpu_count() and os.cpu_count() > 8) else (os.cpu_count() or 4)
+
             cmd = [
                 CPP_EXEC,
-                "--model", model_path,
-                "--tokenizer", TOKENIZER_PATH,
+                "-m", model_path,
+                "-t", TOKENIZER_PATH,
                 "--server",
-                "--threads", str(cpu_total),
-                "--threads-batch", str(cpu_total),
+                "-threads", str(threads),
             ]
             if "CPU ONLY" not in cpp_model_str:
                 if filename in CUDA_NATIVE_MODELS:

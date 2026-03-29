@@ -1,5 +1,12 @@
 #!/bin/bash
 
+# Performance Optimizations for OpenMP (Threading Affinity)
+# This ensures threads stay on the fastest cores and prevents skipping.
+export OMP_PROC_BIND=TRUE
+export OMP_PLACES=CORES
+export OMP_WAIT_POLICY=PASSIVE
+export KMP_BLOCKTIME=0
+
 # Fish Speech S2 Pro - Linux / WSL Installer
 # Usage: bash install.sh
 
@@ -165,11 +172,17 @@ if command -v nvcc &> /dev/null || [ -d "/usr/local/cuda" ]; then
         GENERATOR="Unix Makefiles"
         if command -v ninja &> /dev/null; then GENERATOR="Ninja"; fi
         
-        Write-Info "Configuring and Building S2.cpp with $GENERATOR..."
+        # CPU Optimization flags for Linux (O3, march=native, OpenMP)
+        export CXXFLAGS="-O3 -march=native -ffast-math -fopenmp -DNDEBUG"
+        export LDFLAGS="-fopenmp"
+
+        Write-Info "Configuring and Building S2.cpp with $GENERATOR (O3 Optimized)..."
         cmake .. -G "$GENERATOR" \
                  -DS2_CUDA=ON \
                  -DS2_VULKAN=ON \
-                 -DCMAKE_BUILD_TYPE=Release
+                 -DCMAKE_BUILD_TYPE=Release \
+                 -DCMAKE_CXX_FLAGS="$CXXFLAGS" \
+                 -DCMAKE_EXE_LINKER_FLAGS="$LDFLAGS"
         
         if [ "$GENERATOR" = "Ninja" ]; then
             ninja

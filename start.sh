@@ -1,4 +1,11 @@
-#!/bin/bash
+# Performance Optimizations for OpenMP (Threading Affinity)
+# This ensures threads stay on the fastest cores and prevents skipping.
+export OMP_PROC_BIND=TRUE
+export OMP_PLACES=CORES
+export OMP_WAIT_POLICY=PASSIVE
+export KMP_BLOCKTIME=0
+
+echo "Starting Fish Speech S2 Pro GUI..."
 
 # Fish Speech S2 Pro - Linux / WSL Start Script
 # Usage: bash start.sh
