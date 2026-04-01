@@ -13,6 +13,7 @@ import numpy as np
 import glob
 import yaml
 import winsound
+import sys
 
 # Audio Chime Path
 CHIME_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "inference_training_done.wav")
@@ -42,6 +43,7 @@ os.environ["KMP_BLOCKTIME"] = "0"
 
 s2_process = None
 s2_current_model = None
+training_process = None
 
 # Fish Python Persistence Cache
 fish_python_model = None
@@ -121,10 +123,29 @@ def get_dataset_choices():
 
 def get_trained_models():
     base = ["Base Model (Fish S2 Pro)"]
-    trained_dir = os.path.join(MODELS_DIR, "trained_models")
-    if not os.path.exists(trained_dir): return base
-    subdirs = [d for d in os.listdir(trained_dir) if os.path.isdir(os.path.join(trained_dir, d))]
-    return base + sorted(subdirs)
+    trained_dir = TRAINED_MODELS_DIR
+    if os.path.exists(trained_dir):
+        subdirs = [d for d in os.listdir(trained_dir) if os.path.isdir(os.path.join(trained_dir, d))]
+        base += sorted(subdirs)
+    return base
+
+def handle_clear_results():
+    results_dir = os.path.join(FS_DIR, "results")
+    if os.path.exists(results_dir):
+        import shutil
+        for item in os.listdir(results_dir):
+             path = os.path.join(results_dir, item)
+             try:
+                 if os.path.isdir(path): shutil.rmtree(path)
+                 else: os.remove(path)
+             except: pass
+    return "All intermediate training results (LoRAs) have been cleared."
+
+def get_existing_training_projects():
+    results_dir = os.path.join(FS_DIR, "results")
+    if not os.path.exists(results_dir): return []
+    subdirs = [d for d in os.listdir(results_dir) if os.path.isdir(os.path.join(results_dir, d))]
+    return sorted(subdirs)
 
 def load_sample(sample_name):
     if not sample_name:
@@ -155,8 +176,8 @@ def generate_fish_python(text, ref_audio, ref_text, top_p, top_k, temp, rep_pen,
     global fish_python_model, fish_python_codec, fish_python_decode_one_token, fish_python_checkpoint_dir
     from pathlib import Path
     
-    target_dir = os.path.join(MODELS_DIR, "trained_models", model_select) if model_select and model_select != "Base Model (Fish S2 Pro)" else FISH_MODELS_DIR
-    
+    target_dir = os.path.join(TRAINED_MODELS_DIR, model_select) if model_select and model_select != "Base Model (Fish S2 Pro)" else FISH_MODELS_DIR
+        
     if fish_python_model is None or fish_python_checkpoint_dir != target_dir:
         import gc
         if fish_python_model is not None:
@@ -234,6 +255,9 @@ def generate_fish_python(text, ref_audio, ref_text, top_p, top_k, temp, rep_pen,
         fish_python_codec = instantiate(codec_cfg)
         
         codec_checkpoint_path = os.path.join(fish_python_checkpoint_dir, "codec.pth")
+        if not os.path.exists(codec_checkpoint_path):
+            codec_checkpoint_path = os.path.join(FISH_MODELS_DIR, "codec.pth")
+            
         state_dict = torch.load(codec_checkpoint_path, map_location="cpu", weights_only=False)
         if "state_dict" in state_dict:
             state_dict = state_dict["state_dict"]
@@ -609,7 +633,7 @@ def clone_voice(engine, cpp_model_str, trained_model_select, text, ref_audio, re
 
         try:
             import soundfile as sf
-            audio_np, sr = generate_fish_python(text, ref_audio, ref_text, top_p, top_k, temp, rep_pen, split_by_paragraph, trained_model_select, progress=progress)
+            audio_np, sr = generate_fish_python(text, ref_audio, ref_text, top_p, top_k, temp, rep_pen, split_by_paragraph, trained_model_select, progress)
             progress(0.9, desc="Saving audio...")
             sf.write(out_wav, audio_np, sr)
             play_done_chime()
@@ -919,30 +943,43 @@ def delete_sample(sample_name):
 # --- Training Backend Functions ---
 
 def run_training_step(cmd, desc, progress):
+    global training_process
     progress(0.1, desc=f"Starting {desc}... (Check the console for the progress)")
     import subprocess
     
     # Run from FS_DIR to ensure hydra and relative paths work
-    process = subprocess.Popen(
+    # Use CREATE_NEW_PROCESS_GROUP to allow sending CTRL_BREAK_EVENT for graceful save on Windows
+    training_process = subprocess.Popen(
         cmd,
-        cwd=FS_DIR if "python " in cmd else ROOT_DIR,
+        cwd=FS_DIR if "python" in cmd else ROOT_DIR,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
         bufsize=1,
-        shell=True if os.name == 'nt' else False
+        shell=True if os.name == 'nt' else False,
+        creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == 'nt' else 0
     )
     
     logs = []
-    for line in iter(process.stdout.readline, ""):
-        line = line.strip()
-        if line:
-            print(f"[{desc}] {line}")
-            logs.append(line)
     
-    process.wait()
-    if process.returncode != 0:
-        return False, f"{desc} failed with return code {process.returncode}.\n\nLast logs:\n" + "\n".join(logs[-10:])
+    # Use a local reference to avoid race conditions when the process is stopped/reset from UI
+    p = training_process
+    if p:
+        for line in iter(p.stdout.readline, ""):
+            line = line.strip()
+            if line:
+                print(f"[{desc}] {line}")
+                logs.append(line)
+        
+        p.wait()
+        ret_code = p.returncode
+    else:
+        ret_code = 0 # Assume finished or aborted cleanly if none
+        
+    training_process = None # Reset global on finish
+    
+    if ret_code != 0 and ret_code != -1: # -1 might be manual kill
+        return False, f"{desc} failed with return code {ret_code}.\n\nLast logs:\n" + "\n".join(logs[-10:])
     return True, f"{desc} completed successfully."
 
 def handle_lora_dataset_prep(output_name, progress=gr.Progress()):
@@ -971,7 +1008,7 @@ def handle_lora_vq_extraction(output_name, progress=gr.Progress()):
         from huggingface_hub import hf_hub_download
         hf_hub_download(repo_id="fishaudio/s2-pro", filename="codec.pth", local_dir=FISH_MODELS_DIR)
 
-    cmd = f"uv run python tools/vqgan/extract_vq.py \"{data_dir}\" --config-name modded_dac_vq --checkpoint-path \"{codec_path}\" --num-workers 1 --batch-size 1"
+    cmd = f"\"{sys.executable}\" tools/vqgan/extract_vq.py \"{data_dir}\" --config-name modded_dac_vq --checkpoint-path \"{codec_path}\" --num-workers 1 --batch-size 1"
     success, msg = run_training_step(cmd, "VQ Extraction", progress)
     return msg
 
@@ -980,7 +1017,7 @@ def handle_lora_sharding(output_name, progress=gr.Progress()):
     proto_dir = os.path.join(data_dir, "protos")
     os.makedirs(proto_dir, exist_ok=True)
     
-    cmd = f"uv run python tools/llama/build_dataset.py --input \"{data_dir}\" --output \"{proto_dir}\" --text-extension .lab --num-workers 4"
+    cmd = f"\"{sys.executable}\" tools/llama/build_dataset.py --input \"{data_dir}\" --output \"{proto_dir}\" --text-extension .lab --num-workers 4"
     success, msg = run_training_step(cmd, "Sharding", progress)
     return msg
 
@@ -1005,7 +1042,7 @@ def handle_lora_train(output_name, model_name, max_steps, lr, progress=gr.Progre
     
     cmd = (
         f"set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True && "
-        f"uv run python fish_speech/train.py "
+        f"\"{sys.executable}\" fish_speech/train.py "
         f"--config-name text2semantic_finetune "
         f"project={model_name} "
         f"+lora@model.model.lora_config=r_32_alpha_16_fast "
@@ -1023,7 +1060,7 @@ def handle_lora_train(output_name, model_name, max_steps, lr, progress=gr.Progre
     success, msg = run_training_step(cmd, "LoRA Training", progress)
     return success, msg
 
-def handle_lora_unified(output_name, model_name, max_steps, lr, vram_preset, lora_rank=32, lora_alpha=16, progress=gr.Progress()):
+def handle_lora_unified(output_name, model_name, max_steps, lr, vram_preset, lora_rank=32, lora_alpha=16, save_every=50, progress=gr.Progress()):
     msg_log = []
     
     msg_log.append("--- Step 1: Dataset Preparation ---")
@@ -1047,6 +1084,16 @@ def handle_lora_unified(output_name, model_name, max_steps, lr, vram_preset, lor
     msg_log.append("--- Step 4: LoRA Training ---")
     progress(0.7, desc="Starting LoRA Training...")
     
+    # Overwrite logic (Always fresh start for stability)
+    proj_dir = os.path.join(FS_DIR, "results", model_name)
+    if os.path.exists(proj_dir):
+         import shutil
+         progress(0.71, desc="Wiping existing project for a fresh start...")
+         try:
+             shutil.rmtree(proj_dir)
+         except Exception as e:
+             print(f"Warning: Could not clear existing project: {e}")
+
     dataset_dir = os.path.join(TRAINING_DATA_DIR, output_name)
     proto_dir = os.path.join(dataset_dir, "protos")
     if not os.path.exists(proto_dir):
@@ -1091,12 +1138,17 @@ def handle_lora_unified(output_name, model_name, max_steps, lr, vram_preset, lor
         acc_grad = 4
         
     ckpt_dir_save = os.path.abspath(os.path.join(FS_DIR, "results", model_name, "checkpoints")).replace("\\", "/")
+    os.makedirs(ckpt_dir_save, exist_ok=True)
+
+    # End-to-end training (Resume disabled for stability)
+    resume_flags = ""
 
     cmd = (
         f"set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True && "
-        f"uv run python fish_speech/train.py "
+        f"\"{sys.executable}\" fish_speech/train.py "
         f"--config-name text2semantic_finetune "
         f"project={model_name} "
+        f"{resume_flags}"
         f"+lora@model.model.lora_config={lora_config_name} "
         f"trainer.max_steps={int(max_steps)} "
         f"model.lr_scheduler.T_max={int(max_steps)} "
@@ -1110,9 +1162,10 @@ def handle_lora_unified(output_name, model_name, max_steps, lr, vram_preset, lor
         f"train_dataset.proto_files=[{proto_dir_abs}] "
         f"val_dataset.proto_files=[{proto_dir_abs}] "
         f"~callbacks.audio_sample "
-        f"callbacks.model_checkpoint.dirpath=\"{ckpt_dir_save}\" "
-        f"callbacks.model_checkpoint.every_n_train_steps=50 "
-        f"callbacks.model_checkpoint.save_last=True"
+        f"trainer.val_check_interval={int(save_every)} "
+        f"callbacks.model_checkpoint.every_n_train_steps={int(save_every)} "
+        f"callbacks.model_checkpoint.save_last=True "
+        f"model.optimizer.weight_decay=0.01"
     )
     
     success, msg = run_training_step(cmd, "LoRA Training", progress)
@@ -1184,11 +1237,59 @@ def handle_lora_list_checkpoints(model_name):
         results = ["last.ckpt"] + results
     return results
 
+def launch_tensorboard_handler(model_name):
+    if not model_name:
+        return "Please enter a Model Name first."
+    
+    log_dir = os.path.join(FS_DIR, "results", model_name, "tensorboard")
+    if not os.path.exists(log_dir):
+        # Check if the parent results dir exists to avoid confusion
+        parent_dir = os.path.join(FS_DIR, "results", model_name)
+        if not os.path.exists(parent_dir):
+            return f"Model directory '{model_name}' not found. Start training first."
+        os.makedirs(log_dir, exist_ok=True)
+
+    import socket
+    def get_free_port(start):
+        for port in range(start, start + 10):
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                if s.connect_ex(('localhost', port)) != 0:
+                    return port
+        return start
+
+    port = get_free_port(6006)
+    cmd = f"tensorboard --logdir \"{log_dir}\" --port {port}"
+    
+    creationflags = 0
+    if os.name == 'nt':
+        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
+        
+    subprocess.Popen(
+        cmd, 
+        shell=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=creationflags
+    )
+    
+    # Give Tensorboard a moment to start before opening the browser
+    time.sleep(5.0)
+    
+    # Auto-open browser
+    import webbrowser
+    url = f"http://localhost:{port}"
+    try:
+        webbrowser.open(url)
+    except: pass
+    
+    return f"Tensorboard launched for '{model_name}' at {url} (Opened in browser)"
+
 def handle_lora_export(model_name, ckpt_name=None, fs_lora_rank=32, fs_lora_alpha=16, progress=gr.Progress()):
     if not model_name:
-        return "Model name missing."
-        
-    if not ckpt_name:
+        return "Error: Please enter a Model Name to export."
+    
+    # Auto-detect latest if ckpt_name is None
+    if ckpt_name is None:
         # Check for last.ckpt first, then highest step
         ckpts = handle_lora_list_checkpoints(model_name)
         if not ckpts:
@@ -1201,7 +1302,9 @@ def handle_lora_export(model_name, ckpt_name=None, fs_lora_rank=32, fs_lora_alph
         
     progress(0.1, desc=f"Preparing Export for {ckpt_name}...")
     ckpt_path = os.path.join(FS_DIR, "results", model_name, "checkpoints", ckpt_name)
-    output_dir = os.path.join(MODELS_DIR, "trained_models", model_name)
+    
+    # We always export to the TRAINED_MODELS_DIR now
+    output_dir = os.path.join(TRAINED_MODELS_DIR, model_name)
     os.makedirs(output_dir, exist_ok=True)
     
     # Merge LoRA script
@@ -1209,12 +1312,23 @@ def handle_lora_export(model_name, ckpt_name=None, fs_lora_rank=32, fs_lora_alph
     ckpt_path_abs = os.path.abspath(ckpt_path).replace("\\", "/")
     output_dir_abs = os.path.abspath(output_dir).replace("\\", "/")
     
-    lora_config_name = f"r_{fs_lora_rank}_alpha_{fs_lora_alpha}"
-    if fs_lora_rank == 32 and fs_lora_alpha == 16:
-        lora_config_name = "r_32_alpha_16_fast"
+    # Try to use the exact config used during training for this project
+    # This prevents rank mismatch if the user changed sliders after training
+    project_config_name = f"run_{model_name}"
+    project_config_path = os.path.join(FS_DIR, "fish_speech", "configs", "lora", f"{project_config_name}.yaml")
+    
+    if os.path.exists(project_config_path):
+        lora_config_name = project_config_name
+        print(f"Using project-specific LoRA config: {lora_config_name}")
+    else:
+        # Fallback to manual construction from sliders (for legacy or external models)
+        lora_config_name = f"r_{fs_lora_rank}_alpha_{fs_lora_alpha}"
+        if fs_lora_rank == 32 and fs_lora_alpha == 16:
+            lora_config_name = "r_32_alpha_16_fast"
+        print(f"Project config not found, using manual LoRA config: {lora_config_name}")
         
     cmd = (
-        f"uv run python tools/llama/merge_lora.py "
+        f"\"{sys.executable}\" tools/llama/merge_lora.py "
         f"--lora-config {lora_config_name} "
         f"--base-weight \"{base_weight}\" "
         f"--lora-weight \"{ckpt_path_abs}\" "
@@ -1234,7 +1348,7 @@ def handle_lora_export(model_name, ckpt_name=None, fs_lora_rank=32, fs_lora_alph
         if os.path.exists(src):
             shutil.copy(src, dst)
             
-    return f"✅ Export Complete!\n\nYour trained S2 Model is now ready for use at:\n`{output_dir}`"
+    return f"✅ Export Complete!\n\nYour model is now ready at:\n`{output_dir}`"
 
 theme = gr.themes.Ocean(
     neutral_hue=gr.themes.Color(c100="#f3f4f6", c200="#e5e7eb", c300="#d1d5db", c400="#9ca3af", c50="#f9fafb", c500="#6b7280", c600="hsl(215, 7%, 34%)", c700="hsl(217, 10%, 27%)", c800="hsl(215, 14%, 17%)", c900="hsl(221, 20%, 11%)", c950="hsl(223, 20%, 7%)"),
@@ -1298,11 +1412,33 @@ with gr.Blocks(title="Fish Speech S2 Pro - Voice Clone & Training GUI") as app:
 
                 with gr.Column(scale=3):
                     gr.Markdown("### Generate Speech")
-                    target_text = gr.Textbox(
-                        label="Text to Generate",
-                        placeholder="Enter the text you want to speak in the cloned voice...",
-                        lines=6
-                    )
+                    with gr.Row():
+                        target_text = gr.Textbox(
+                            label="Text to Generate",
+                            placeholder="Enter the text you want to speak in the cloned voice...",
+                            lines=6,
+                            scale=10
+                        )
+                        with gr.Column(scale=1, min_width=100):
+                            split_counter_display = gr.Markdown("### ✂️ Splits\n**1** Clip", elem_id="split-counter", visible=False)
+
+                    with gr.Row():
+                        with gr.Accordion("🏷️ Supported Generation Tags", open=False):
+                            gr.Markdown("""
+                            S2 Pro enables localized control over speech generation by embedding natural-language instructions directly within the text using `[tag]` syntax. 
+                            Rather than relying on a fixed set of predefined tags, S2 Pro accepts free-form textual descriptions — such as `[whisper in small voice]`, `[professional broadcast tone]`, or `[pitch up]` — allowing open-ended expression control at the word level.
+
+                            **Common tags (15,000+ unique tags supported):**
+                            `[pause]` `[emphasis]` `[laughing]` `[inhale]` `[chuckle]` `[tsk]` `[singing]` `[excited]` `[laughing tone]` `[interrupting]` `[chuckling]` `[excited tone]` `[volume up]` `[echo]` `[angry]` `[low volume]` `[sigh]` `[low voice]` `[whisper]` `[screaming]` `[shouting]` `[loud]` `[surprised]` `[short pause]` `[exhale]` `[delight]` `[panting]` `[audience laughter]` `[with strong accent]` `[volume down]` `[clearing throat]` `[sad]` `[moaning]` `[shocked]` and much more...
+                            """)
+                        with gr.Accordion("🌐 Supported Languages", open=False):
+                            gr.Markdown("""
+                            S2 Pro supports **80+** languages.
+                            
+                            **Tier 1:** Japanese (ja), English (en), Chinese (zh)
+                            **Tier 2:** Korean (ko), Spanish (es), Portuguese (pt), Arabic (ar), Russian (ru), French (fr), German (de)
+                            **Other supported languages:** sv, it, tr, no, nl, cy, eu, ca, da, gl, ta, hu, fi, pl, et, hi, la, ur, th, vi, jw, bn, yo, xsl, cs, sw, nn, he, ms, uk, id, kk, bg, lv, my, tl, sk, ne, fa, af, el, bo, hr, ro, sn, mi, yi, am, be, km, is, az, sd, br, sq, ps, mn, ht, ml, sr, sa, te, ka, bs, pa, lt, kn, si, hy, mr, as, gu, fo, and more.
+                            """)
                     
                     engine_dropdown = gr.Dropdown(
                         choices=["Fish Speech S2 Pro (CPP)", "Fish Speech S2 Pro (PyTorch)"],
@@ -1346,9 +1482,28 @@ with gr.Blocks(title="Fish Speech S2 Pro - Voice Clone & Training GUI") as app:
                         temperature_slider = gr.Slider(0.1, 2.0, value=0.7, step=0.1, label="Temperature")
                         rep_pen_slider = gr.Slider(1.0, 2.0, value=1.2, step=0.05, label="Repetition Penalty")
                         split_para_check = gr.Checkbox(label="Split by Paragraphs (Recommended for long texts)", value=False)
+                        gr.Markdown("ℹ️ *To apply splits, you must press **Enter** after each sentence or point where you want a cut; each line break will generate an independent audio clip that will be automatically merged.*")
                         
                     with gr.Row():
                         generate_btn = gr.Button("Generate Audio 🚀", variant="primary", size="lg")
+                        
+                    def update_split_count(text):
+                        if not text: return "### ✂️ Splits\n**0** Clips"
+                        paragraphs = [p.strip() for p in text.split('\n') if p.strip()]
+                        count = len(paragraphs)
+                        return f"### ✂️ Splits\n**{count}** {'Clip' if count == 1 else 'Clips'}"
+
+                    target_text.change(
+                        fn=update_split_count,
+                        inputs=[target_text],
+                        outputs=[split_counter_display]
+                    )
+
+                    split_para_check.change(
+                        fn=lambda x: gr.update(visible=x),
+                        inputs=[split_para_check],
+                        outputs=[split_counter_display]
+                    )
                         
                     with gr.Row():
                         output_audio = gr.Audio(label="Generated Audio", type="filepath")
@@ -1546,8 +1701,20 @@ with gr.Blocks(title="Fish Speech S2 Pro - Voice Clone & Training GUI") as app:
                     prep_tab_single.select(fn=show_samples_group, inputs=[], outputs=[audio_samples_group])
                     prep_tab_dataset.select(fn=hide_samples_group, inputs=[], outputs=[audio_samples_group])
 
-        with gr.Tab("Lora Training", id="tab_lora_training"):
+        with gr.Tab("Lora Training (Experimental)", id="tab_lora_training"):
             gr.Markdown("### 🏋️ Fish Speech S2 Pro LoRA Training Pipeline")
+            
+            gr.Markdown("""
+---
+### 🧪 **Notice: LoRA Fine-Tuning is Experimental**
+*Fish Speech S2 PRO* is a highly-tuned foundation model. LoRA training might not show significant improvements for small or standard datasets. However, it can make a noticeable difference when:
+- Working with **extremely large datasets**.
+- Teaching the model a **new language**, unique **accent**, or specific **dialect**.
+- Fine-tuning for **style-specific** speech patterns.
+
+⚠️ **Note:** Training is computationally intensive and exclusive to GPUs with **more than 24 GB of VRAM**.
+---
+""")
             
             with gr.Row():
                 with gr.Column(scale=1):
@@ -1573,7 +1740,15 @@ with gr.Blocks(title="Fish Speech S2 Pro - Voice Clone & Training GUI") as app:
                 with gr.Column(scale=1):
                     gr.Markdown("### ⚙️ Training Configuration")
                     with gr.Accordion("Training Settings", open=True):
-                        model_name_input = gr.Textbox(label="Trained Model Name", placeholder="e.g. speaker_v1")
+                        with gr.Row():
+                            model_name_input = gr.Dropdown(
+                                label="Trained Model Name", 
+                                choices=get_existing_training_projects(),
+                                allow_custom_value=True,
+                                info="Select existing project or type a new name",
+                                scale=8
+                            )
+                            refresh_models_btn = gr.Button("🔄", scale=1, min_width=50)
                         
                         with gr.Row():
                             train_max_steps = gr.Slider(50, 5000, value=1000, step=50, label="Max Steps", info="Auto-calculated")
@@ -1582,8 +1757,38 @@ with gr.Blocks(title="Fish Speech S2 Pro - Voice Clone & Training GUI") as app:
                         with gr.Row():
                             fs_lora_rank = gr.Slider(minimum=4, maximum=64, value=32, step=4, label="LoRA Rank (r)")
                             fs_lora_alpha = gr.Slider(minimum=4, maximum=64, value=16, step=4, label="LoRA Alpha")
-                            
-                        train_btn = gr.Button("🚀 Start Training", variant="primary", size="lg")
+                            adv_save_every = gr.Slider(minimum=10, maximum=500, value=50, step=10, label="Save Every N Steps")
+                                
+                        with gr.Row():
+                            train_btn = gr.Button("🚀 Start Training", variant="primary", size="lg", scale=3)
+                            stop_train_btn = gr.Button("🛑 Stop Training", variant="stop", size="lg", scale=1)
+                        
+                        with gr.Row():
+                            tensorboard_btn = gr.Button("📊 Launch Tensorboard", variant="secondary", size="lg")
+                        
+                        with gr.Group():
+                            gr.Markdown("#### 📦 Export LoRA Model")
+                            with gr.Row():
+                                export_ckpt_select = gr.Dropdown(
+                                    label="Available Checkpoints", 
+                                    choices=[], 
+                                    info="Select which step/checkpoint to export",
+                                    scale=8
+                                )
+                                export_refresh_ckpts = gr.Button("🔄", scale=1, min_width=50)
+                                export_btn = gr.Button("📦 Convert & Export", variant="secondary", scale=4)
+                        
+                        with gr.Row():
+                            clear_results_btn = gr.Button("🗑️ Clear All LoRA Results", variant="stop", size="sm")
+                        
+                        gr.Markdown("""
+### ⚠️ **LoRA Results & Cleanup Information:**
+
+1. **Model Name Dropdown:** This selector is used to browse existing projects for **Exporting LoRA Models** or **Launching Tensorboard**. 
+2. **Auto-Overwrite:** Clicking **🚀 Start Training** will **completely wipe** the selected model's results folder before starting a fresh, end-to-end training. To avoid losing intermediate checkpoints, choose a NEW model name.
+3. **Clear All LoRA Results:** This button deletes **all** intermediate checkpoints and logs from `modules/s2/results`. 
+4. **Exported Models:** None of the above will delete your **final exported models** stored in `models/trained_models` (the ones you use for inference).
+""")
                         
                     training_status = gr.Textbox(label="Status Console", lines=10, interactive=False)
                     
@@ -1592,17 +1797,61 @@ with gr.Blocks(title="Fish Speech S2 Pro - Voice Clone & Training GUI") as app:
 
             # --- Training Actions ---
             refresh_folders_btn.click(fn=lambda: gr.update(choices=get_dataset_choices()), outputs=[training_output_name])
+            
             analyze_btn.click(analyze_dataset, [training_output_name, vram_preset_radio], [dataset_info, train_max_steps])
             
-            auto_train_done_event = train_btn.click(
+            train_btn.click(
                 handle_lora_unified, 
-                [training_output_name, model_name_input, train_max_steps, train_lr, vram_preset_radio, fs_lora_rank, fs_lora_alpha], 
+                [training_output_name, model_name_input, train_max_steps, train_lr, vram_preset_radio, fs_lora_rank, fs_lora_alpha, adv_save_every], 
                 training_status
             )
-            auto_train_done_event.then(
-                fn=lambda mn, rank, alpha: handle_lora_export(mn, None, rank, alpha), 
-                inputs=[model_name_input, fs_lora_rank, fs_lora_alpha], 
+
+            tensorboard_btn.click(
+                fn=launch_tensorboard_handler,
+                inputs=[model_name_input],
                 outputs=[training_status]
+            )
+
+            clear_results_btn.click(fn=handle_clear_results, outputs=[training_status])
+
+            def stop_training_handler():
+                global training_process
+                if training_process:
+                    import os, signal
+                    try:
+                        # Send CTRL_BREAK_EVENT to let Lightning save last.ckpt and exit
+                        print(f"Stopping training gracefully (PID {training_process.pid})...")
+                        os.kill(training_process.pid, signal.CTRL_BREAK_EVENT)
+                        return "Graceful stop signal sent. Checkpoint saving in progress... (You can use 'Clear VRAM' if needed)"
+                    except Exception as e:
+                        return f"Error stopping process: {str(e)}"
+                return "No training process currently active."
+
+            def update_ckpts(mn):
+                ckpts = handle_lora_list_checkpoints(mn)
+                if ckpts:
+                    return gr.update(choices=ckpts, value=ckpts[0])
+                return gr.update(choices=[], value=None)
+
+            model_name_input.change(fn=update_ckpts, inputs=[model_name_input], outputs=[export_ckpt_select])
+            export_refresh_ckpts.click(fn=update_ckpts, inputs=[model_name_input], outputs=[export_ckpt_select])
+
+            stop_train_btn.click(fn=stop_training_handler, outputs=[training_status])
+
+            export_btn.click(
+                fn=handle_lora_export, 
+                inputs=[model_name_input, export_ckpt_select, fs_lora_rank, fs_lora_alpha], 
+                outputs=[training_status]
+            )
+
+            refresh_models_btn.click(
+                fn=lambda: gr.update(choices=get_existing_training_projects()),
+                outputs=[model_name_input]
+            )
+            
+            clear_results_btn.click(fn=handle_clear_results, outputs=[training_status]).then(
+                fn=lambda: gr.update(choices=get_existing_training_projects()),
+                outputs=[model_name_input]
             )
 
 if __name__ == "__main__":

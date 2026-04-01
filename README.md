@@ -27,7 +27,15 @@ We have successfully achieved **Linux-level inference speeds on Windows** throug
     *   Uses **Faster-Whisper** for rapid, accurate batched transcriptions (creates `.lab` files).
     *   Generates `metadata.csv` required for training automatically.
 
-### 🏋️ LoRA Training Pipeline
+### 🏋️ LoRA Training Pipeline (Experimental)
+> [!IMPORTANT]
+> **LoRA Fine-Tuning is Experimental:** *Fish Speech S2 PRO* is a highly-tuned foundation model. LoRA training might not show significant improvements for small or standard datasets. However, it can make a noticeable difference when:
+> - Working with **extremely large datasets**.
+> - Teaching the model a **new language**, unique **accent**, or specific **dialect**.
+> - Fine-tuning for **style-specific** speech patterns.
+> 
+> ⚠️ **Hardware Requirement:** Training is computationally intensive and exclusive to GPUs with **more than 24 GB of VRAM**.
+
 *   **Unified Workflow**: A simplified, 4-step pipeline that handles dataset preparation, VQ code extraction, sharding, and actual LoRA training.
 *   **VRAM Optimization**: Hardware presets for **24GB** and **32GB+ VRAM** to auto-tune batch sizes and gradient accumulation.
 *   **Auto-Tune Max Steps**: Automatically calculates the optimal number of training steps based on your dataset size.

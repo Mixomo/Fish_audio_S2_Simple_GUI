@@ -212,3 +212,5 @@ __marimo__/
 /outputs/
 /models/
 /datasets/
+/modules/s2/results/
+/modules/s2/fish_speech/configs/lora/run_*.yaml

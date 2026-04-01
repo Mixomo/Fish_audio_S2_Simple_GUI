@@ -294,7 +294,7 @@ if (-not $cudaToolkitPath -and -not (Get-Command nvcc -ErrorAction SilentlyConti
 # Extra deps
 # -------------------------------------------------------
 Write-Header "Installing additional dependencies"
-uv pip install soundfile librosa numpy "pydantic>=2.0" faster-whisper ctranslate2 huggingface_hub hf-xet loralib gradio loguru transformers datasets lightning hydra-core tensorboard natsort einops rich wandb grpcio kui uvicorn pyrootutils resampy einx zstandard pydub pyaudio modelscope opencc-python-reimplemented silero-vad ormsgpack tiktoken cachetools descript-audio-codec safetensors google-genai deepgram-sdk pyannote.audio triton-windows
+uv pip install soundfile librosa numpy "pydantic>=2.0" "protobuf>=3.19,<4" faster-whisper ctranslate2 huggingface_hub hf-xet loralib gradio loguru transformers datasets lightning hydra-core tensorboard natsort einops rich wandb grpcio kui uvicorn pyrootutils resampy einx zstandard pydub pyaudio modelscope opencc-python-reimplemented silero-vad ormsgpack tiktoken cachetools descript-audio-codec safetensors google-genai deepgram-sdk pyannote.audio triton-windows
 
 # -------------------------------------------------------
 # Verify
