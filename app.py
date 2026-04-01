@@ -156,6 +156,29 @@ def get_trained_models():
     subdirs = [d for d in os.listdir(trained_dir) if os.path.isdir(os.path.join(trained_dir, d))]
     return base + sorted(subdirs)
 
+def handle_clear_results():
+    results_dir = os.path.join(ROOT_DIR, "modules", "s2", "results")
+    if os.name != 'nt': # Extra safety for linux paths
+         results_dir = os.path.abspath(results_dir)
+         
+    if os.path.exists(results_dir):
+        import shutil
+        for item in os.listdir(results_dir):
+             path = os.path.join(results_dir, item)
+             try:
+                 if os.path.isdir(path): shutil.rmtree(path)
+                 else: os.remove(path)
+             except: pass
+    return "All intermediate training results (LoRAs) have been cleared."
+
+def get_existing_training_projects():
+    results_dir = os.path.join(ROOT_DIR, "modules", "s2", "results")
+    if not os.path.exists(results_dir): return []
+    try:
+        subdirs = [d for d in os.listdir(results_dir) if os.path.isdir(os.path.join(results_dir, d))]
+        return sorted(subdirs)
+    except: return []
+
 def load_sample(sample_name):
     if not sample_name:
         return gr.update(value=None), gr.update(value="")
@@ -931,33 +954,57 @@ def delete_sample(sample_name):
 
 # --- Training Backend Functions ---
 
+current_train_process = None
+
+def handle_stop_training():
+    global current_train_process
+    if current_train_process and current_train_process.poll() is None:
+        import os, signal
+        try:
+             if os.name == 'nt':
+                 current_train_process.terminate()
+             else:
+                 # On Linux, kill the process group to ensure all hydra sub-processes die
+                 os.killpg(os.getpgid(current_train_process.pid), signal.SIGTERM)
+             return "🛑 Training Stop Signal Sent."
+        except:
+             try: current_train_process.kill()
+             except: pass
+             return "🛑 Training Forcefully Terminated."
+    return "No active training process found."
+
 def run_training_step(cmd, desc, progress):
+    global current_train_process
     progress(0.1, desc=f"Starting {desc}... (Check the console for the progress)")
+    
+    fs_dir = os.path.join(ROOT_DIR, "modules", "s2")
+    import sys
     import subprocess
     
     # Run from FS_DIR to ensure hydra and relative paths work
-    process = subprocess.Popen(
+    current_train_process = subprocess.Popen(
         cmd,
-        cwd=FS_DIR if ("python" in cmd.lower() or sys.executable in cmd) else ROOT_DIR,
-
+        cwd=fs_dir if ("python" in cmd.lower() or sys.executable in cmd) else ROOT_DIR,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
         bufsize=1,
-        shell=True # Enable shell for string commands on all platforms
+        shell=True,
+        preexec_fn=os.setsid if os.name != 'nt' else None # Create process group on Linux for clean kills
     )
 
-    
     logs = []
-    for line in iter(process.stdout.readline, ""):
+    for line in iter(current_train_process.stdout.readline, ""):
         line = line.strip()
         if line:
             print(f"[{desc}] {line}")
             logs.append(line)
     
-    process.wait()
-    if process.returncode != 0:
-        return False, f"{desc} failed with return code {process.returncode}.\n\nLast logs:\n" + "\n".join(logs[-10:])
+    current_train_process.wait()
+    if current_train_process.returncode != 0:
+        if current_train_process.returncode == -15 or current_train_process.returncode == 15:
+             return False, "🛑 Training was stopped by the user."
+        return False, f"{desc} failed with return code {current_train_process.returncode}.\n\nLast logs:\n" + "\n".join(logs[-10:])
     return True, f"{desc} completed successfully."
 
 def handle_lora_dataset_prep(output_name, progress=gr.Progress()):
@@ -1003,48 +1050,7 @@ def handle_lora_sharding(output_name, progress=gr.Progress()):
     success, msg = run_training_step(cmd, "Sharding", progress)
     return msg
 
-def handle_lora_train(output_name, model_name, max_steps, lr, progress=gr.Progress()):
-    dataset_dir = os.path.join(TRAINING_DATA_DIR, output_name)
-    proto_dir = os.path.join(dataset_dir, "protos")
-    if not os.path.exists(proto_dir):
-        return f"Sharded data not found at {proto_dir}. Please run sharding first."
-        
-    # Prepare result dir
-    if not model_name:
-        model_name = f"{output_name}_{int(time.time())}"
-    
-    # Check for pretrained model
-    if not os.path.exists(os.path.join(FISH_MODELS_DIR, "model.pth")):
-        from huggingface_hub import snapshot_download
-        snapshot_download(repo_id="fishaudio/s2-pro", local_dir=FISH_MODELS_DIR)
-
-    # Note: Use forward slashes for hydra on Windows or escape properly
-    proto_dir_abs = os.path.abspath(proto_dir).replace("\\", "/")
-    ckpt_dir_abs = os.path.abspath(FISH_MODELS_DIR).replace("\\", "/")
-    
-    import sys
-    env_setter = "set" if os.name == 'nt' else "export"
-    cmd = (
-        f"{env_setter} PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True && "
-        f'"{sys.executable}" fish_speech/train.py '
-
-        f"--config-name text2semantic_finetune "
-        f"project={model_name} "
-        f"+lora@model.model.lora_config=r_32_alpha_16_fast "
-        f"trainer.max_steps={max_steps} "
-        f"model.optimizer.lr={lr} "
-        f"trainer.strategy=auto "
-        f"trainer.devices=1 "
-        f"data.num_workers=0 "
-        f"pretrained_ckpt_path=\"{ckpt_dir_abs}\" "
-        f"train_dataset.proto_files=[{proto_dir_abs}] "
-        f"val_dataset.proto_files=[{proto_dir_abs}]"
-    )
-    
-    success, msg = run_training_step(cmd, "LoRA Training", progress)
-    return success, msg
-
-def handle_lora_unified(output_name, model_name, max_steps, lr, vram_preset, lora_rank=32, lora_alpha=16, progress=gr.Progress()):
+def handle_lora_unified(output_name, model_name, max_steps, lr, vram_preset, lora_rank=32, lora_alpha=16, save_every=50, progress=gr.Progress()):
     msg_log = []
     
     msg_log.append("--- Step 1: Dataset Preparation ---")
@@ -1068,6 +1074,16 @@ def handle_lora_unified(output_name, model_name, max_steps, lr, vram_preset, lor
     msg_log.append("--- Step 4: LoRA Training ---")
     progress(0.7, desc="Starting LoRA Training...")
     
+    # Overwrite logic (Always fresh start for stability)
+    proj_dir = os.path.join(ROOT_DIR, "modules", "s2", "results", model_name)
+    if os.path.exists(proj_dir):
+         import shutil
+         progress(0.71, desc="Wiping existing project for a fresh start...")
+         try:
+             shutil.rmtree(proj_dir)
+         except Exception as e:
+             print(f"Warning: Could not clear existing project: {e}")
+
     dataset_dir = os.path.join(TRAINING_DATA_DIR, output_name)
     proto_dir = os.path.join(dataset_dir, "protos")
     if not os.path.exists(proto_dir):
@@ -1084,11 +1100,9 @@ def handle_lora_unified(output_name, model_name, max_steps, lr, vram_preset, lor
     proto_dir_abs = os.path.abspath(proto_dir).replace("\\", "/")
     ckpt_dir_abs = os.path.abspath(FISH_MODELS_DIR).replace("\\", "/")
     
-    # We will pass lora parameters inside a json file or directly via override.
-    # To be safe, we'll keep using the built-in fast_attention lora config but modify r and alpha if possible.
-    # Let's write a dynamic config file inside fish_speech.
+    # Write dynamic LoRA config
     lora_config_name = f"run_{model_name}"
-    lora_config_dir = os.path.join(FS_DIR, "fish_speech", "configs", "lora")
+    lora_config_dir = os.path.join(ROOT_DIR, "modules", "s2", "fish_speech", "configs", "lora")
     os.makedirs(lora_config_dir, exist_ok=True)
     lora_config_path = os.path.join(lora_config_dir, f"{lora_config_name}.yaml")
     
@@ -1111,16 +1125,23 @@ def handle_lora_unified(output_name, model_name, max_steps, lr, vram_preset, lor
         bs = 1
         acc_grad = 4
         
-    ckpt_dir_save = os.path.abspath(os.path.join(FS_DIR, "results", model_name, "checkpoints")).replace("\\", "/")
+    ckpt_dir_save = os.path.abspath(os.path.join(ROOT_DIR, "modules", "s2", "results", model_name, "checkpoints")).replace("\\", "/")
+    os.makedirs(ckpt_dir_save, exist_ok=True)
 
+    # End-to-end training (Resume disabled for stability)
+    resume_flags = ""
+
+    import sys
     env_setter = "set" if os.name == 'nt' else "export"
     cmd = (
         f"{env_setter} PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True && "
         f'"{sys.executable}" fish_speech/train.py '
         f"--config-name text2semantic_finetune "
         f"project={model_name} "
+        f"{resume_flags}"
         f"+lora@model.model.lora_config={lora_config_name} "
         f"trainer.max_steps={int(max_steps)} "
+        f"model.lr_scheduler.T_max={int(max_steps)} "
         f"trainer.accumulate_grad_batches={acc_grad} "
         f"data.batch_size={bs} "
         f"model.optimizer.lr={float(lr)} "
@@ -1130,9 +1151,11 @@ def handle_lora_unified(output_name, model_name, max_steps, lr, vram_preset, lor
         f"pretrained_ckpt_path=\"{ckpt_dir_abs}\" "
         f"train_dataset.proto_files=[{proto_dir_abs}] "
         f"val_dataset.proto_files=[{proto_dir_abs}] "
-        f"callbacks.model_checkpoint.dirpath=\"{ckpt_dir_save}\" "
-        f"callbacks.model_checkpoint.every_n_train_steps=50 "
-        f"callbacks.model_checkpoint.save_last=True"
+        f"~callbacks.audio_sample "
+        f"trainer.val_check_interval={int(save_every)} "
+        f"callbacks.model_checkpoint.every_n_train_steps={int(save_every)} "
+        f"callbacks.model_checkpoint.save_last=True "
+        f"model.optimizer.weight_decay=0.01"
     )
     
     success, msg = run_training_step(cmd, "LoRA Training", progress)
@@ -1189,16 +1212,62 @@ def analyze_dataset(folder, vram_preset):
     
     return report, target_steps
 
+def launch_tensorboard_handler(model_name):
+    if not model_name:
+        return "Please enter a Model Name to launch Tensorboard."
+    
+    log_dir = os.path.abspath(os.path.join(ROOT_DIR, "modules", "s2", "results", model_name, "tensorboard")).replace("\\", "/")
+    if not os.path.exists(log_dir):
+        return f"No Tensorboard logs found for '{model_name}' at {log_dir}"
+    
+    import socket
+    def get_free_port(start):
+        for port in range(start, start + 100):
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                if s.connect_ex(('localhost', port)) != 0:
+                    return port
+        return start
+
+    port = get_free_port(6006)
+    cmd = f"tensorboard --logdir \"{log_dir}\" --port {port}"
+    
+    creationflags = 0
+    if os.name == 'nt':
+        import subprocess
+        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
+        
+    subprocess.Popen(
+        cmd, 
+        shell=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=creationflags
+    )
+    
+    # Give Tensorboard a moment to start before opening the browser
+    time.sleep(5.0)
+    
+    # Auto-open browser
+    import webbrowser
+    url = f"http://localhost:{port}"
+    try:
+        webbrowser.open(url)
+    except: pass
+    
+    return f"Tensorboard launched for '{model_name}' at {url} (Opened in browser)"
+
 def handle_lora_list_checkpoints(model_name):
     if not model_name:
         return []
-    ckpt_base = os.path.join(FS_DIR, "results", model_name, "checkpoints")
+    ckpt_base = os.path.join(ROOT_DIR, "modules", "s2", "results", model_name, "checkpoints")
     if not os.path.exists(ckpt_base):
         return []
+    
     import glob
     ckpts = glob.glob(os.path.join(ckpt_base, "*.ckpt"))
-    # Always include last.ckpt if it exists, and sort it to the top
     ckpts_basenames = [os.path.basename(c) for c in ckpts]
+    
+    # Sort: step=XXX.ckpt desc, last.ckpt at top
     results = sorted([c for c in ckpts_basenames if c != "last.ckpt"], reverse=True)
     if "last.ckpt" in ckpts_basenames:
         results = ["last.ckpt"] + results
@@ -1206,10 +1275,10 @@ def handle_lora_list_checkpoints(model_name):
 
 def handle_lora_export(model_name, ckpt_name=None, fs_lora_rank=32, fs_lora_alpha=16, progress=gr.Progress()):
     if not model_name:
-        return "Model name missing."
-        
-    if not ckpt_name:
-        # Check for last.ckpt first, then highest step
+        return "Error: Please enter a Model Name to export."
+    
+    # Auto-detect latest if ckpt_name is None
+    if ckpt_name is None:
         ckpts = handle_lora_list_checkpoints(model_name)
         if not ckpts:
             return "No checkpoints found to export."
@@ -1217,24 +1286,38 @@ def handle_lora_export(model_name, ckpt_name=None, fs_lora_rank=32, fs_lora_alph
         if "last.ckpt" in ckpts:
             ckpt_name = "last.ckpt"
         else:
-            ckpt_name = ckpts[0] # handle_lora_list_checkpoints returns sorted reverse=True
+            ckpt_name = ckpts[0]
         
     progress(0.1, desc=f"Preparing Export for {ckpt_name}...")
-    ckpt_path = os.path.join(FS_DIR, "results", model_name, "checkpoints", ckpt_name)
-    output_dir = os.path.join(MODELS_DIR, "trained_models", model_name)
+    ckpt_path = os.path.join(ROOT_DIR, "modules", "s2", "results", model_name, "checkpoints", ckpt_name)
+    
+    # We always export to the TRAINED_MODELS_DIR now
+    output_dir = os.path.join(TRAINED_MODELS_DIR, model_name)
     os.makedirs(output_dir, exist_ok=True)
     
     # Merge LoRA script
-    base_weight = os.path.abspath(FISH_MODELS_DIR).replace("\\", "/") # Path to base model inside models/fish-speech
+    base_weight = os.path.abspath(FISH_MODELS_DIR).replace("\\", "/") 
     ckpt_path_abs = os.path.abspath(ckpt_path).replace("\\", "/")
     output_dir_abs = os.path.abspath(output_dir).replace("\\", "/")
     
-    lora_config_name = f"r_{fs_lora_rank}_alpha_{fs_lora_alpha}"
-    if fs_lora_rank == 32 and fs_lora_alpha == 16:
-        lora_config_name = "r_32_alpha_16_fast"
+    # Try to use the exact config used during training for this project
+    # This prevents rank mismatch if the user changed sliders after training
+    project_config_name = f"run_{model_name}"
+    project_config_path = os.path.join(ROOT_DIR, "modules", "s2", "fish_speech", "configs", "lora", f"{project_config_name}.yaml")
+    
+    if os.path.exists(project_config_path):
+        lora_config_name = project_config_name
+        print(f"Using project-specific LoRA config: {lora_config_name}")
+    else:
+        # Fallback to manual construction from sliders
+        lora_config_name = f"r_{fs_lora_rank}_alpha_{fs_lora_alpha}"
+        if fs_lora_rank == 32 and fs_lora_alpha == 16:
+            lora_config_name = "r_32_alpha_16_fast"
+        print(f"Project config not found, using manual LoRA config: {lora_config_name}")
         
+    import sys
     cmd = (
-        f"uv run python tools/llama/merge_lora.py "
+        f"\"{sys.executable}\" tools/llama/merge_lora.py "
         f"--lora-config {lora_config_name} "
         f"--base-weight \"{base_weight}\" "
         f"--lora-weight \"{ckpt_path_abs}\" "
@@ -1245,7 +1328,7 @@ def handle_lora_export(model_name, ckpt_name=None, fs_lora_rank=32, fs_lora_alph
     if not success:
         return f"failed: {msg}"
         
-    # Copy essential codec and topology files required for inference
+    # Copy essential files
     progress(0.8, desc="Copying inference topologies...")
     import shutil
     for file_to_copy in ["codec.pth", "tokenizer.json", "firefly-gan-vq-fsq-8x1024-21hz-generator.pth"]:
@@ -1254,7 +1337,7 @@ def handle_lora_export(model_name, ckpt_name=None, fs_lora_rank=32, fs_lora_alph
         if os.path.exists(src):
             shutil.copy(src, dst)
             
-    return f"✅ Export Complete!\n\nYour trained S2 Model is now ready for use at:\n`{output_dir}`"
+    return f"✅ Export Complete!\n\nYour trained LoRA Model is now ready for use at:\n`{output_dir}`"
 
 theme = gr.themes.Ocean(
     neutral_hue=gr.themes.Color(c100="#f3f4f6", c200="#e5e7eb", c300="#d1d5db", c400="#9ca3af", c50="#f9fafb", c500="#6b7280", c600="hsl(215, 7%, 34%)", c700="hsl(217, 10%, 27%)", c800="hsl(215, 14%, 17%)", c900="hsl(221, 20%, 11%)", c950="hsl(223, 20%, 7%)"),
@@ -1566,8 +1649,20 @@ with gr.Blocks(title="Fish Speech S2 Pro - Voice Clone & Training GUI") as app:
                     prep_tab_single.select(fn=show_samples_group, inputs=[], outputs=[audio_samples_group])
                     prep_tab_dataset.select(fn=hide_samples_group, inputs=[], outputs=[audio_samples_group])
 
-        with gr.Tab("Lora Training", id="tab_lora_training"):
+        with gr.Tab("Lora Training (Experimental)", id="tab_lora_training"):
             gr.Markdown("### 🏋️ Fish Speech S2 Pro LoRA Training Pipeline")
+            
+            gr.Markdown("""
+---
+### 🧪 **Notice: LoRA Fine-Tuning is Experimental**
+*Fish Speech S2 PRO* is a highly-tuned foundation model. LoRA training might not show significant improvements for small or standard datasets. However, it can make a noticeable difference when:
+- Working with **extremely large datasets**.
+- Teaching the model a **new language**, unique **accent**, or specific **dialect**.
+- Fine-tuning for **style-specific** speech patterns.
+
+⚠️ **Note:** Training is computationally intensive and exclusive to GPUs with **more than 24 GB of VRAM**.
+---
+""")
             
             with gr.Row():
                 with gr.Column(scale=1):
@@ -1583,48 +1678,99 @@ with gr.Blocks(title="Fish Speech S2 Pro - Voice Clone & Training GUI") as app:
                     
                     train_quick_guide = """
 **Fish Speech S2 PRO Training Guide:**
-1. Use the "Dataset Creation" tab to prepare your dataset.
-2. Select your Dataset Folder and your Hardware Preset.
-3. Click **Analyze Dataset** to auto-tune max steps.
+1. Use the **Prep Samples** tab to prepare your data.
+2. Select your **Dataset Folder** and click **Analyze**.
+3. Choose a **Model Name** (type a new name for a fresh start).
 4. Click **Start Auto-Training**.
+5. Once trained, use the **Export Group** at the bottom to finalize your model.
 """
                     gr.Markdown(train_quick_guide)
+                    clear_results_btn = gr.Button("🗑️ Clear All LoRA Results", variant="stop", size="sm")
                         
                 with gr.Column(scale=1):
                     gr.Markdown("### ⚙️ Training Configuration")
-                    with gr.Accordion("Training Settings", open=True):
-                        model_name_input = gr.Textbox(label="Trained Model Name", placeholder="e.g. speaker_v1")
+                    with gr.Accordion("Fine-Tuning Parameters", open=True):
+                        model_name_input = gr.Dropdown(
+                            label="Trained Model Name", 
+                            choices=get_existing_training_projects(),
+                            value=get_existing_training_projects()[0] if get_existing_training_projects() else "",
+                            allow_custom_value=True,
+                            info="Select an existing one or type a new name."
+                        )
                         
                         with gr.Row():
-                            train_max_steps = gr.Slider(50, 5000, value=1000, step=50, label="Max Steps", info="Auto-calculated")
+                            train_max_steps = gr.Slider(50, 5000, value=1000, step=50, label="Max Steps", info="Auto-tuned")
                             train_lr = gr.Number(value=1e-5, label="Learning Rate")
                             
                         with gr.Row():
-                            fs_lora_rank = gr.Slider(minimum=4, maximum=64, value=32, step=4, label="LoRA Rank (r)")
-                            fs_lora_alpha = gr.Slider(minimum=4, maximum=64, value=16, step=4, label="LoRA Alpha")
-                            
-                        train_btn = gr.Button("🚀 Start Training", variant="primary", size="lg")
+                            fs_lora_rank = gr.Slider(minimum=4, maximum=128, value=32, step=4, label="LoRA Rank (r)")
+                            fs_lora_alpha = gr.Slider(minimum=4, maximum=128, value=16, step=4, label="LoRA Alpha")
                         
-                    training_status = gr.Textbox(label="Status Console", lines=10, interactive=False)
-                    
-                    # Automatic Step 3: Result info (No manual buttons)
-                    model_path_display = gr.Markdown("")
+                        adv_save_every = gr.Slider(10, 500, value=50, step=10, label="Checkpoint every X steps")
 
-            # --- Training Actions ---
+                        with gr.Row():
+                            train_btn = gr.Button("🚀 Start Training", variant="primary", scale=2)
+                            stop_train_btn = gr.Button("🛑 Stop", variant="stop", scale=1)
+                            
+                        gr.Markdown("---")
+                        tensorboard_btn = gr.Button("📊 Launch Tensorboard", variant="secondary")
+
+                    training_status = gr.Textbox(label="Status Console", lines=10, interactive=False)
+
+            # --- Isolated LoRA Export Group ---
+            gr.Markdown("---")
+            with gr.Group():
+                gr.Markdown("### 🗳️ LoRA Model Export & Finalization")
+                with gr.Row():
+                    with gr.Column(scale=2):
+                        export_ckpt_dropdown = gr.Dropdown(label="Available Checkpoints", choices=[], interactive=True)
+                    with gr.Column(scale=1):
+                        refresh_ckpts_btn = gr.Button("🔄 Refresh Checkpoints")
+                        export_btn = gr.Button("🛰️ Convert & Export LoRA Model", variant="primary")
+                
+                gr.Markdown("<p style='font-size: 0.85em; color: gray;'>This merges the LoRA weights into the base model. Final models appear in the <code>Trained LoRA Model</code> dropdown in the Voice Clone tab.</p>")
+
+            # --- Actions & Events ---
             refresh_folders_btn.click(fn=lambda: gr.update(choices=get_dataset_choices()), outputs=[training_output_name])
             analyze_btn.click(analyze_dataset, [training_output_name, vram_preset_radio], [dataset_info, train_max_steps])
             
-            auto_train_done_event = train_btn.click(
+            # Auto-update checkpoint dropdown when model name changes
+            def update_ckpts(mn):
+                ckpts = handle_lora_list_checkpoints(mn)
+                return gr.update(choices=ckpts, value=ckpts[0] if ckpts else None)
+            
+            model_name_input.change(update_ckpts, [model_name_input], [export_ckpt_dropdown])
+            refresh_ckpts_btn.click(update_ckpts, [model_name_input], [export_ckpt_dropdown])
+            
+            train_btn.click(
                 handle_lora_unified, 
-                [training_output_name, model_name_input, train_max_steps, train_lr, vram_preset_radio, fs_lora_rank, fs_lora_alpha], 
+                [training_output_name, model_name_input, train_max_steps, train_lr, vram_preset_radio, fs_lora_rank, fs_lora_alpha, adv_save_every], 
                 training_status
+            ).then(
+                fn=lambda mn: gr.update(choices=get_existing_training_projects(), value=mn),
+                inputs=[model_name_input],
+                outputs=[model_name_input]
             )
-            auto_train_done_event.then(
-                fn=lambda mn, rank, alpha: handle_lora_export(mn, None, rank, alpha), 
-                inputs=[model_name_input, fs_lora_rank, fs_lora_alpha], 
+
+            stop_train_btn.click(handle_stop_training, outputs=[training_status])
+            tensorboard_btn.click(launch_tensorboard_handler, [model_name_input], [training_status])
+            
+            export_btn.click(
+                handle_lora_export, 
+                [model_name_input, export_ckpt_dropdown, fs_lora_rank, fs_lora_alpha], 
+                training_status
+            ).then(
+                fn=lambda: gr.update(choices=get_trained_models()),
+                outputs=[trained_model_dropdown]
+            )
+            
+            clear_results_btn.click(
+                fn=handle_clear_results, 
                 outputs=[training_status]
+            ).then(
+                fn=lambda: gr.update(choices=get_existing_training_projects(), value=""),
+                outputs=[model_name_input]
             )
 
 if __name__ == "__main__":
-    # Use "127.0.0.1" for local access or "0.0.0.0" for network access
     app.launch(server_name="127.0.0.1", server_port=7860, inbrowser=True)
