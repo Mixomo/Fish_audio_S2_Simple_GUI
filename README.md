@@ -2,6 +2,14 @@
 
 A comprehensive, all-in-one Graphical User Interface (GUI) for **Fish Speech S2 Pro**. This project streamlines the process of voice cloning, dataset preparation, and LoRA training, providing a robust and optimized experience on Windows with full GPU acceleration.
 
+<img src="./assets/inference_tab.png">
+
+<img src="./assets/sample_tab_1.png">
+
+<img src="./assets/sample_tab_2.png">
+
+<img src="./assets/train_tab.png">
+
 ### 🚀 2026-03-29 - Windows Performance Breakthrough
 We have successfully achieved **Linux-level inference speeds on Windows** through several major architectural optimizations:
 *   **Ninja + MSVC Integration**: Transitioned to the **Ninja build system** and **Visual Studio 2022** with high-performance compiler flags (`/Ox`, `/arch:AVX2`, `/LTCG`) for an ultra-optimized C++ and Pytroch inference engines.
