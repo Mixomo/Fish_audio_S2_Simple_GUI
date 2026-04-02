@@ -2,6 +2,14 @@
 
 A comprehensive, all-in-one Graphical User Interface (GUI) for **Fish Speech S2 Pro**. This project streamlines the process of voice cloning, dataset preparation, and LoRA training, providing a robust and optimized experience on **Linux / WSL** with full GPU acceleration.
 
+<img src="./assets/inference_tab.png">
+
+<img src="./assets/sample_tab_1.png">
+
+<img src="./assets/sample_tab_2.png">
+
+<img src="./assets/train_tab.png">
+
 ### 🚀 2026-03-29 - Power Optimizations (Linux/WSL)
 The project now features high-performance improvements for Linux/WSL platforms:
 *   **Ninja + GCC/Clang Build Optimization**: Faster and more efficient C++ builds using the **Ninja** build system and **GCC/Clang** with high-performance flags (`-O3`, `-march=native`, `-ffast-math`).
