@@ -45,6 +45,12 @@ s2_process = None
 s2_current_model = None
 training_process = None
 
+# CPP server stdout drain thread & queue (module-level to avoid recreation/leak)
+import queue as _queue
+import threading as _threading
+_s2_log_queue = _queue.Queue()
+_s2_drain_thread = None
+
 # Fish Python Persistence Cache
 fish_python_model = None
 fish_python_codec = None
@@ -72,6 +78,24 @@ os.environ["TRITON_CACHE_DIR"] = CACHE_DIR
 # Optimization flag to cache FX graphs
 os.environ["TORCHINDUCTOR_FX_GRAPH_CACHE"] = "1"
 
+# --- Startup: Cache Status Report ---
+_cache_kernel_count = 0
+try:
+    _cache_kernel_count = sum(1 for _, _, files in os.walk(CACHE_DIR) for f in files if f.endswith('.py'))
+except Exception:
+    pass
+
+print("----------------------------------------------------------------")
+if _cache_kernel_count >= 50:
+    print(f"[Fish Speech] Persistent cache found at models/.cache ({_cache_kernel_count} compiled kernels).")
+    print("[Fish Speech] PyTorch engine will use cached kernels — fast startup expected.")
+else:
+    print(f"[Fish Speech] No persistent cache found (or incomplete: {_cache_kernel_count} kernels).")
+    print("[Fish Speech] NOTICE: First PyTorch generation will compile kernels (~5 min). Subsequent runs will be fast.")
+print("----------------------------------------------------------------")
+
+HAS_COMPILE_CACHE = (_cache_kernel_count >= 50)
+
 import sys
 if os.path.join(ROOT_DIR, "modules", "s2") not in sys.path:
     sys.path.insert(0, os.path.join(ROOT_DIR, "modules", "s2"))
@@ -96,6 +120,10 @@ GGUF_MODELS = {
 #   Q6_K..Q4_K_M    -> Vulkan (-v 0) — k-quants need Vulkan backend
 #   Q3_K, Q2_K      -> CPU only (no GPU flag)
 CUDA_NATIVE_MODELS = {"s2-pro-f16.gguf", "s2-pro-q8_0.gguf"}
+
+# --- Engine Names ---
+ENGINE_CPP = "Fish Speech S2 Pro (CPP) (VRAM Efficient - Slower)"
+ENGINE_PYTORCH = "Fish Speech S2 Pro (PyTorch) (Fastest - 24GB+ VRAM only)"
 
 WHISPER_LANGS = {
     "Auto-detect": None,
@@ -148,8 +176,9 @@ def get_existing_training_projects():
     return sorted(subdirs)
 
 def load_sample(sample_name):
+    """Load sample audio and text. Returns (audio_path_or_None, text_str)."""
     if not sample_name:
-        return gr.update(value=None), gr.update(value="")
+        return None, ""
     audio_path = os.path.join(SAMPLES_DIR, f"{sample_name}.wav")
     txt_path = os.path.join(SAMPLES_DIR, f"{sample_name}.txt")
     json_path = os.path.join(SAMPLES_DIR, f"{sample_name}.json")
@@ -159,16 +188,20 @@ def load_sample(sample_name):
         try:
             with open(json_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-                text = data.get("Text", "")
+                text = data.get("Text", "") or data.get("text", "")
         except: pass
     
     if not text and os.path.exists(txt_path):
-        with open(txt_path, "r", encoding="utf-8") as f:
-            text = f.read().strip()
+        for enc in ['utf-8', 'utf-8-sig', 'latin-1']:
+            try:
+                with open(txt_path, "r", encoding=enc) as f:
+                    text = f.read().strip()
+                if text: break
+            except: pass
             
     if os.path.exists(audio_path):
-        return gr.update(value=audio_path), gr.update(value=text)
-    return gr.update(value=None), gr.update(value="")
+        return audio_path, text
+    return None, text
 
 # --- Helper functions ---
 
@@ -406,7 +439,7 @@ def clone_voice(engine, cpp_model_str, trained_model_select, text, ref_audio, re
     # Calculate auto tokens based on target text length dynamically
     expected_new_tokens = int(len(text) * 4.5)
     
-    if engine == "Fish Speech S2 Pro (CPP)":
+    if engine == ENGINE_CPP:
         # Auto-Unload PyTorch if switching to CPP
         global fish_python_model, fish_python_codec
         if fish_python_model is not None:
@@ -514,12 +547,15 @@ def clone_voice(engine, cpp_model_str, trained_model_select, text, ref_audio, re
             )
             s2_current_model = filename
             
-            # Wait for server ready — use a background thread to drain stdout
-            # so readline() never blocks the main thread
-            import queue
-            import threading
+            # Wait for server ready.
+            # Re-use module-level log_queue & drain_thread to avoid re-creating
+            # closures on every call (was causing RAM leak).
+            global _s2_log_queue, _s2_drain_thread
+            # Drain any leftover items from a previous startup
+            while not _s2_log_queue.empty():
+                try: _s2_log_queue.get_nowait()
+                except: break
 
-            log_queue = queue.Queue()
             captured_logs = []
 
             def _drain_stdout(proc, q):
@@ -531,8 +567,8 @@ def clone_voice(engine, cpp_model_str, trained_model_select, text, ref_audio, re
                 finally:
                     q.put(None)  # sentinel
 
-            drain_thread = threading.Thread(target=_drain_stdout, args=(s2_process, log_queue), daemon=True)
-            drain_thread.start()
+            _s2_drain_thread = _threading.Thread(target=_drain_stdout, args=(s2_process, _s2_log_queue), daemon=True)
+            _s2_drain_thread.start()
 
             start_time = time.time()
             ready = False
@@ -542,8 +578,8 @@ def clone_voice(engine, cpp_model_str, trained_model_select, text, ref_audio, re
                 # Drain all log lines currently available (non-blocking)
                 while True:
                     try:
-                        line = log_queue.get_nowait()
-                    except queue.Empty:
+                        line = _s2_log_queue.get_nowait()
+                    except _queue.Empty:
                         break
                     if line is None:
                         break
@@ -575,8 +611,73 @@ def clone_voice(engine, cpp_model_str, trained_model_select, text, ref_audio, re
             # Extra wait: server binds port before model is fully loaded into VRAM
             time.sleep(2)
                 
-        progress(0.7, desc="Synthesizing audio...")
+        paragraphs = [p.strip() for p in text.split('\n') if p.strip()]
         
+        # --- Handle Multiple Paragraphs (Split by Paragraph enabled) ---
+        if split_by_paragraph and len(paragraphs) > 1:
+            print(f"[s2.cpp] Processing {len(paragraphs)} paragraphs (Split by Paragraph: Active)...")
+            all_audio_segments = []
+            final_sr = 32000 # Default fallback, normally detected from model
+
+            for idx, para in enumerate(paragraphs):
+                # Calculate tokens for THIS paragraph
+                para_tokens = int(len(para) * 4.5)
+                progress_pct = 0.7 + (idx / len(paragraphs)) * 0.25
+                progress(progress_pct, desc=f"Synthesizing paragraph {idx + 1}/{len(paragraphs)}...")
+                
+                # Retry loop for THIS paragraph
+                current_audio = None
+                max_para_retries = 2
+                for att in range(max_para_retries):
+                    try:
+                        with open(ref_audio, 'rb') as f:
+                            files = {'reference_audio': (os.path.basename(ref_audio), f, 'audio/wav')}
+                            data = {
+                                'text': para,
+                                'ref_text': ref_text,
+                                'params': json.dumps({'max_new_tokens': para_tokens, 'temperature': temp, 'top_p': top_p, 'top_k': top_k, 'repetition_penalty': rep_pen, 'verbose': True})
+                            }
+                            res = requests.post("http://localhost:3030/generate", data=data, files=files, timeout=600)
+                            res.raise_for_status()
+                            
+                        import soundfile as sf
+                        audio_data, sr = sf.read(io.BytesIO(res.content))
+                        final_sr = sr
+                        # Store segment as float32 for clean concatenation
+                        all_audio_segments.append(audio_data.astype(np.float32))
+                        
+                        # Add a tiny bit of silence (0.5s) between paragraphs? optional but usually good
+                        silence = np.zeros(int(sr * 0.5), dtype=np.float32)
+                        all_audio_segments.append(silence)
+                        
+                        current_audio = True
+                        break # Success for this para
+                    except Exception as ecc:
+                        print(f"Error in paragraph {idx+1} (attempt {att+1}): {ecc}")
+                        time.sleep(1)
+                
+                if current_audio is None:
+                    return None, f"Failed to generate paragraph {idx+1} after multiple attempts."
+            
+            # Concatenate all segments
+            if all_audio_segments:
+                combined_audio = np.concatenate(all_audio_segments)
+                # Convert to int16 for Gradio consistency
+                audio_int16 = (combined_audio * 32767).astype(np.int16)
+                import soundfile as sf
+                sf.write(out_wav, audio_int16, final_sr)
+                
+                import gc
+                del all_audio_segments, combined_audio, audio_int16
+                gc.collect()
+                
+                play_done_chime()
+                progress(1.0, desc="Done!")
+                return out_wav, "Synthesis completed successfully (multi-paragraph)!"
+            else:
+                return None, "No audio segments were generated correctly."
+
+        # --- Standard Single-Pass Logic (Used if 1 paragraph or split disabled) ---
         # Retry loop: server may reset connections while finishing VRAM allocation
         max_retries = 3
         last_error = None
@@ -597,6 +698,10 @@ def clone_voice(engine, cpp_model_str, trained_model_select, text, ref_audio, re
                 # Apply fix for Gradio: convert to int16
                 audio_int16 = (audio_data * 32767).astype(np.int16)
                 sf.write(out_wav, audio_int16, sr)
+                # Explicit GC after each generation to prevent RAM growth
+                import gc
+                del audio_data, audio_int16
+                gc.collect()
                 play_done_chime()
                 progress(1.0, desc="Done!")
                 return out_wav, "Synthesis completed successfully!"
@@ -615,7 +720,7 @@ def clone_voice(engine, cpp_model_str, trained_model_select, text, ref_audio, re
             crash_logs = []
             try:
                 while True:
-                    line = log_queue.get_nowait()
+                    line = _s2_log_queue.get_nowait()
                     if line: crash_logs.append(line.strip())
             except Exception: pass
             last_logs = "\n".join(crash_logs[-10:])
@@ -623,7 +728,7 @@ def clone_voice(engine, cpp_model_str, trained_model_select, text, ref_audio, re
             
         return None, f"s2.cpp REST API Error:\n{error_msg}"
             
-    elif engine == "Fish Speech S2 Pro (PyTorch)":
+    elif engine == ENGINE_PYTORCH:
         # Auto-Unload CPP Server if switching to PyTorch
         if s2_process is not None:
             print("Auto-Unloading CPP Server to free VRAM for PyTorch...")
@@ -637,6 +742,13 @@ def clone_voice(engine, cpp_model_str, trained_model_select, text, ref_audio, re
 
         try:
             import soundfile as sf
+            # Cache-aware progress notice
+            if HAS_COMPILE_CACHE:
+                progress(0.05, desc="Loading PyTorch model (kernels cached — fast start)...")
+            else:
+                progress(0.05, desc="[First Run] Compiling CUDA kernels... up to 5 min. See console.")
+                print("[Fish Speech] NOTICE: torch.compile is building kernels for the first time. This may take up to 5 minutes.")
+                print("[Fish Speech] Subsequent generations will be significantly faster.")
             sr, audio_int16 = generate_fish_python(text, ref_audio, ref_text, top_p, top_k, temp, rep_pen, split_by_paragraph, trained_model_select, progress)
             progress(0.9, desc="Saving audio...")
             sf.write(out_wav, audio_int16, sr)
@@ -1354,19 +1466,11 @@ def handle_lora_export(model_name, ckpt_name=None, fs_lora_rank=32, fs_lora_alph
             
     return f"✅ Export Complete!\n\nYour model is now ready at:\n`{output_dir}`"
 
-theme = gr.themes.Ocean(
-    neutral_hue=gr.themes.Color(c100="#f3f4f6", c200="#e5e7eb", c300="#d1d5db", c400="#9ca3af", c50="#f9fafb", c500="#6b7280", c600="hsl(215, 7%, 34%)", c700="hsl(217, 10%, 27%)", c800="hsl(215, 14%, 17%)", c900="hsl(221, 20%, 11%)", c950="hsl(223, 20%, 7%)"),
-    spacing_size=gr.themes.Size(lg="6px", md="4px", sm="2px", xl="9px", xs="1px", xxl="10px", xxs="1px"),
-    primary_hue="orange",
-    secondary_hue="red",
-    text_size="lg",
-    radius_size="md",
-)
-
-custom_css = """
-body.dark { background-color: #0b0f19; }
-#sample-audio-player { margin-top: 10px; }
-"""
+# --- Pre-calculate defaults before building UI (VoxCPM pattern) ---
+# This avoids any app.load() calls that block the browser on startup.
+_sample_choices = get_sample_choices()
+_default_sample = _sample_choices[0] if _sample_choices else None
+_default_audio, _default_text = load_sample(_default_sample)
 
 with gr.Blocks(title="Fish Speech S2 Pro - Voice Clone & Training GUI") as app:
     with gr.Row():
@@ -1398,21 +1502,15 @@ with gr.Blocks(title="Fish Speech S2 Pro - Voice Clone & Training GUI") as app:
                     gr.Markdown("### Voice Sample")
                     with gr.Row():
                         vc_sample_dropdown = gr.Dropdown(
-                            choices=get_sample_choices(),
-                            value=get_sample_choices()[0] if get_sample_choices() else None,
+                            choices=_sample_choices,
+                            value=_default_sample,
                             label="Select Sample",
                             interactive=True,
                             scale=10
                         )
                         vc_sample_refresh_btn = gr.Button("🔄", scale=1, min_width=50)
-                    vc_sample_audio = gr.Audio(label="Sample Preview", type="filepath", interactive=False, elem_id="sample-audio-player")
-                    vc_sample_text = gr.Textbox(label="Sample Text", interactive=False, max_lines=10)
-                    
-                    vc_sample_dropdown.change(
-                        fn=load_sample,
-                        inputs=[vc_sample_dropdown],
-                        outputs=[vc_sample_audio, vc_sample_text]
-                    )
+                    vc_sample_audio = gr.Audio(label="Sample Preview", type="filepath", interactive=False, elem_id="sample-audio-player", value=_default_audio)
+                    vc_sample_text = gr.Textbox(label="Sample Text", interactive=False, max_lines=10, value=_default_text)
 
                 with gr.Column(scale=3):
                     gr.Markdown("### Generate Speech")
@@ -1444,9 +1542,15 @@ with gr.Blocks(title="Fish Speech S2 Pro - Voice Clone & Training GUI") as app:
                             **Other supported languages:** sv, it, tr, no, nl, cy, eu, ca, da, gl, ta, hu, fi, pl, et, hi, la, ur, th, vi, jw, bn, yo, xsl, cs, sw, nn, he, ms, uk, id, kk, bg, lv, my, tl, sk, ne, fa, af, el, bo, hr, ro, sn, mi, yi, am, be, km, is, az, sd, br, sq, ps, mn, ht, ml, sr, sa, te, ka, bs, pa, lt, kn, si, hy, mr, as, gu, fo, and more.
                             """)
                     
+                    # Cache status notification (VoxCPM pattern)
+                    if HAS_COMPILE_CACHE:
+                        gr.Markdown(f"✅ **Persistent Cache Detected:** `models/.cache` contains {_cache_kernel_count} kernels. PyTorch engine will start fast.")
+                    else:
+                        gr.Markdown(f"⚠️ **No Compilation Cache:** `models/.cache` is empty or incomplete. **First PyTorch run will take ~5 minutes** to compile kernels. Subsequent runs will be instant.")
+
                     engine_dropdown = gr.Dropdown(
-                        choices=["Fish Speech S2 Pro (CPP)", "Fish Speech S2 Pro (PyTorch)"],
-                        value="Fish Speech S2 Pro (CPP)",
+                        choices=[ENGINE_CPP, ENGINE_PYTORCH],
+                        value=ENGINE_CPP,
                         label="Inference Engine"
                     )
                     cpp_model_row = gr.Row(visible=True)
@@ -1467,18 +1571,13 @@ with gr.Blocks(title="Fish Speech S2 Pro - Voice Clone & Training GUI") as app:
                         trained_model_refresh_btn = gr.Button("🔄", scale=1, min_width=50)
                         
                     def update_engine_ui(engine):
-                        is_cpp = (engine == "Fish Speech S2 Pro (CPP)")
+                        is_cpp = (engine == ENGINE_CPP)
                         if is_cpp:
                             return gr.update(visible=True), gr.update(visible=False)
                         else:
                             models = get_trained_models()
                             return gr.update(visible=False), gr.update(visible=True)
 
-                    engine_dropdown.change(
-                        fn=update_engine_ui,
-                        inputs=engine_dropdown,
-                        outputs=[cpp_model_row, trained_model_row]
-                    )
                     
                     with gr.Accordion("Advanced Settings", open=False):
                         top_p_slider = gr.Slider(0.1, 1.0, value=0.7, step=0.05, label="Top-P")
@@ -1497,17 +1596,6 @@ with gr.Blocks(title="Fish Speech S2 Pro - Voice Clone & Training GUI") as app:
                         count = len(paragraphs)
                         return f"### ✂️ Splits\n**{count}** {'Clip' if count == 1 else 'Clips'}"
 
-                    target_text.change(
-                        fn=update_split_count,
-                        inputs=[target_text],
-                        outputs=[split_counter_display]
-                    )
-
-                    split_para_check.change(
-                        fn=lambda x: gr.update(visible=x),
-                        inputs=[split_para_check],
-                        outputs=[split_counter_display]
-                    )
                         
                     with gr.Row():
                         output_audio = gr.Audio(label="Generated Audio", type="filepath")
@@ -1515,23 +1603,6 @@ with gr.Blocks(title="Fish Speech S2 Pro - Voice Clone & Training GUI") as app:
                     with gr.Row():
                         clone_status = gr.Textbox(label="Status", interactive=False, lines=2, max_lines=5)
                     
-                    generate_btn.click(
-                        fn=clone_voice,
-                        inputs=[engine_dropdown, cpp_model_dropdown, trained_model_dropdown, target_text, vc_sample_audio, vc_sample_text, top_p_slider, top_k_slider, temperature_slider, rep_pen_slider, split_para_check],
-                        outputs=[output_audio, clone_status]
-                    )
-
-                    vc_sample_refresh_btn.click(
-                        fn=lambda: gr.update(choices=get_sample_choices()),
-                        inputs=None,
-                        outputs=[vc_sample_dropdown]
-                    )
-
-                    trained_model_refresh_btn.click(
-                        fn=lambda: gr.update(choices=get_trained_models()),
-                        inputs=None,
-                        outputs=[trained_model_dropdown]
-                    )
 
         with gr.Tab("Prep Samples", id="tab_prep_samples"):
             gr.Markdown("Prepare audio samples for voice cloning.")
@@ -1540,8 +1611,8 @@ with gr.Blocks(title="Fish Speech S2 Pro - Voice Clone & Training GUI") as app:
                     with gr.Group() as audio_samples_group:
                         gr.Markdown("### Audio Samples")
                         prep_sample_dropdown = gr.Dropdown(
-                            choices=get_sample_choices(),
-                            value=get_sample_choices()[0] if get_sample_choices() else None,
+                            choices=_sample_choices,
+                            value=_default_sample,
                             label="Select Sample",
                             interactive=True
                         )
@@ -1571,7 +1642,7 @@ with gr.Blocks(title="Fish Speech S2 Pro - Voice Clone & Training GUI") as app:
                             Use the **'X'** (top right of the player) to clear the preview and drag or click to upload a new audio. 
                             *Once uploaded, click **Transcribe** to get the text, then **Save Sample** to add it to your library.*
                             """)
-                            prep_audio_editor = gr.Audio(label="Audio Editor (Use Trim icon to edit)", type="filepath", interactive=True)
+                            prep_audio_editor = gr.Audio(label="Audio Editor (Use Trim icon to edit)", type="filepath", interactive=True, value=_default_audio)
                             
                             gr.Markdown("### Reference Text")
                             transcription_output = gr.Textbox(
@@ -1579,7 +1650,8 @@ with gr.Blocks(title="Fish Speech S2 Pro - Voice Clone & Training GUI") as app:
                                 lines=4,
                                 max_lines=10,
                                 interactive=True,
-                                placeholder="Transcription will appear here, or enter/edit text manually..."
+                                placeholder="Transcription will appear here, or enter/edit text manually...",
+                                value=_default_text
                             )
                             
                             with gr.Row():
@@ -1623,45 +1695,77 @@ with gr.Blocks(title="Fish Speech S2 Pro - Voice Clone & Training GUI") as app:
 
                     prep_status = gr.Textbox(label="Status", interactive=False, lines=2)
                     
+                    def show_samples_group():
+                        return gr.update(visible=True)
+                    def hide_samples_group():
+                        return gr.update(visible=False)
+
+                    prep_tab_single = prep_tabs.children[0]
+                    prep_tab_dataset = prep_tabs.children[1]
+
                     def on_prep_sample_select(sample_name):
+                        """load_sample now returns (path_or_None, text_str) directly."""
                         if not sample_name:
                             return None, ""
-                        res_audio, res_text = load_sample(sample_name)
-                        return res_audio.get("value"), res_text.get("value")
-                    
-                    # Initial load for Voice Clone tab
-                    app.load(
-                        fn=lambda: load_sample(get_sample_choices()[0]) if get_sample_choices() else (None, ""),
-                        inputs=None,
-                        outputs=[vc_sample_audio, vc_sample_text]
-                    )
-                    
-                    # Initial load for Prep Samples tab
-                    app.load(
-                        fn=lambda: on_prep_sample_select(get_sample_choices()[0]) if get_sample_choices() else (None, ""),
-                        inputs=None,
-                        outputs=[prep_audio_editor, transcription_output]
+                        return load_sample(sample_name)
+
+
+                    # 2. Main Generation Logic
+                    engine_dropdown.change(
+                        fn=update_engine_ui,
+                        inputs=engine_dropdown,
+                        outputs=[cpp_model_row, trained_model_row]
                     )
 
+                    target_text.change(
+                        fn=update_split_count,
+                        inputs=[target_text],
+                        outputs=[split_counter_display]
+                    )
+
+                    split_para_check.change(
+                        fn=lambda x: gr.update(visible=x),
+                        inputs=[split_para_check],
+                        outputs=[split_counter_display]
+                    )
+
+                    generate_btn.click(
+                        fn=clone_voice,
+                        inputs=[engine_dropdown, cpp_model_dropdown, trained_model_dropdown, target_text, vc_sample_audio, vc_sample_text, top_p_slider, top_k_slider, temperature_slider, rep_pen_slider, split_para_check],
+                        outputs=[output_audio, clone_status]
+                    )
+
+                    # 3. Sample Selection & Management
                     vc_sample_dropdown.change(
                         fn=load_sample,
                         inputs=[vc_sample_dropdown],
                         outputs=[vc_sample_audio, vc_sample_text]
                     )
-                        
+
                     prep_sample_dropdown.change(
                         fn=on_prep_sample_select,
                         inputs=[prep_sample_dropdown],
                         outputs=[prep_audio_editor, transcription_output]
                     )
-                    
-                    # Auto-clear UI fields when audio is cleared
+
+                    vc_sample_refresh_btn.click(
+                        fn=lambda: gr.update(choices=get_sample_choices()),
+                        inputs=None,
+                        outputs=[vc_sample_dropdown]
+                    )
+
+                    trained_model_refresh_btn.click(
+                        fn=lambda: gr.update(choices=get_trained_models()),
+                        inputs=None,
+                        outputs=[trained_model_dropdown]
+                    )
+
                     prep_audio_editor.clear(
                         fn=lambda: ("", ""),
                         inputs=[],
                         outputs=[transcription_output, save_name_input]
                     )
-                    
+
                     transcribe_btn.click(
                         fn=transcribe_only,
                         inputs=[prep_audio_editor, whisper_model_size, whisper_language],
@@ -1673,13 +1777,13 @@ with gr.Blocks(title="Fish Speech S2 Pro - Voice Clone & Training GUI") as app:
                         inputs=[prep_audio_editor],
                         outputs=[prep_audio_editor, prep_status]
                     )
-                    
+
                     mono_single_btn.click(
                         fn=lambda x: fix_audio_single(x, normalize=False, to_mono=True),
                         inputs=[prep_audio_editor],
                         outputs=[prep_audio_editor, prep_status]
                     )
-                    
+
                     batch_process_btn.click(
                         fn=handle_full_batch_process,
                         inputs=[batch_folder_input, batch_dataset_name, whisper_model_size, whisper_language, faster_whisper_batch],
@@ -1695,13 +1799,6 @@ with gr.Blocks(title="Fish Speech S2 Pro - Voice Clone & Training GUI") as app:
                         inputs=[], outputs=[vc_sample_dropdown]
                     )
 
-                    def show_samples_group():
-                        return gr.update(visible=True)
-                    def hide_samples_group():
-                        return gr.update(visible=False)
-
-                    prep_tab_single = prep_tabs.children[0]
-                    prep_tab_dataset = prep_tabs.children[1]
                     prep_tab_single.select(fn=show_samples_group, inputs=[], outputs=[audio_samples_group])
                     prep_tab_dataset.select(fn=hide_samples_group, inputs=[], outputs=[audio_samples_group])
 
@@ -1816,8 +1913,6 @@ with gr.Blocks(title="Fish Speech S2 Pro - Voice Clone & Training GUI") as app:
                 outputs=[training_status]
             )
 
-            clear_results_btn.click(fn=handle_clear_results, outputs=[training_status])
-
             def stop_training_handler():
                 global training_process
                 if training_process:
@@ -1852,7 +1947,7 @@ with gr.Blocks(title="Fish Speech S2 Pro - Voice Clone & Training GUI") as app:
                 fn=lambda: gr.update(choices=get_existing_training_projects()),
                 outputs=[model_name_input]
             )
-            
+
             clear_results_btn.click(fn=handle_clear_results, outputs=[training_status]).then(
                 fn=lambda: gr.update(choices=get_existing_training_projects()),
                 outputs=[model_name_input]

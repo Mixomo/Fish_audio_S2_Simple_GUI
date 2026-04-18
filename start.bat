@@ -14,10 +14,10 @@ echo   Fish Speech S2 Pro - GUI
 echo =======================================================
 echo Checking environment...
 
-:: Refresh PATH from Registry in case Ninja/CUDA were just installed via winget
-for /f "tokens=2*" %%A in ('reg query "HKLM\System\CurrentControlSet\Control\Session Manager\Environment" /v Path 2^>nul') do set "SYS_PATH=%%B"
-for /f "tokens=2*" %%A in ('reg query "HKCU\Environment" /v Path 2^>nul') do set "USER_PATH=%%B"
-set "PATH=%SYS_PATH%;%USER_PATH%;%PATH%"
+:: Refreshing PATH from registry is causing "Line too long" errors due to doubling entries.
+:: Normal terminal behavior already includes these paths. If you just installed something,
+:: please restart your terminal instead.
+echo Checking for Ninja...
 
 where ninja >nul 2>nul
 if %ERRORLEVEL% NEQ 0 (
