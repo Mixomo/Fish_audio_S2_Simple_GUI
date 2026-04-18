@@ -392,7 +392,9 @@ def generate_fish_python(text, ref_audio, ref_text, top_p, top_k, temp, rep_pen,
     torch.cuda.empty_cache()
     torch.cuda.synchronize()
         
-    return audio_np, sample_rate
+    # Apply fix for Gradio: convert to int16 before returning
+    audio_int16 = (audio_np * 32767).astype(np.int16)
+    return sample_rate, audio_int16
 
 def clone_voice(engine, cpp_model_str, trained_model_select, text, ref_audio, ref_text, top_p, top_k, temp, rep_pen, split_by_paragraph, progress=gr.Progress()):
     global s2_process, s2_current_model
@@ -604,7 +606,9 @@ def clone_voice(engine, cpp_model_str, trained_model_select, text, ref_audio, re
                     
                 import soundfile as sf
                 audio_data, sr = sf.read(io.BytesIO(res.content))
-                sf.write(out_wav, audio_data, sr)
+                # Apply fix for Gradio: convert to int16
+                audio_int16 = (audio_data * 32767).astype(np.int16)
+                sf.write(out_wav, audio_int16, sr)
                 play_done_chime()
                 progress(1.0, desc="Done!")
                 return out_wav, "Synthesis completed successfully!"
@@ -645,9 +649,9 @@ def clone_voice(engine, cpp_model_str, trained_model_select, text, ref_audio, re
 
         try:
             import soundfile as sf
-            audio_np, sr = generate_fish_python(text, ref_audio, ref_text, top_p, top_k, temp, rep_pen, split_by_paragraph, trained_model_select, progress=progress)
+            sr, audio_int16 = generate_fish_python(text, ref_audio, ref_text, top_p, top_k, temp, rep_pen, split_by_paragraph, trained_model_select, progress=progress)
             progress(0.9, desc="Saving audio...")
-            sf.write(out_wav, audio_np, sr)
+            sf.write(out_wav, audio_int16, sr)
             play_done_chime()
             
             # Clean VRAM after logic
