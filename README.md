@@ -56,6 +56,14 @@ We have successfully achieved **Linux-level inference speeds on Windows** throug
 
 ## 🚀 Quick Start (Windows)
 
+### 0. Clone the repository
+
+```bash
+git clone https://github.com/Mixomo/Fish_audio_S2_Simple_GUI.git
+
+cd Fish_audio_S2_Simple_GUI
+```
+
 ### 1. Installation
 Simply run the batch installer:
 ```cmd
