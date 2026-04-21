@@ -55,6 +55,14 @@ The project now features high-performance improvements for Linux/WSL platforms:
 
 ## 🚀 Quick Start (Linux / WSL)
 
+### 0. Clone the repository
+
+```bash
+git clone -b main_linux https://github.com/Mixomo/Fish_audio_S2_Simple_GUI.git
+
+cd Fish_audio_S2_Simple_GUI
+```
+
 ### 1. Installation
 
 First, navigate to the project directory and give execution permissions to the scripts:
