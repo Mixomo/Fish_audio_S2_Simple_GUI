@@ -10,7 +10,7 @@ A comprehensive, all-in-one Graphical User Interface (GUI) for **Fish Speech S2 
 
 <img src="./assets/train_tab.png">
 
-### 2026-04-24 - Add of Dialogue Builder - Multi Speaker Support Inference
+### 2026-04-24 - Add Dialogue Builder - Multi Speaker Support Inference
 We've introduced a **Dialogue Builder** sub-tab within the Voice Clone interface, designed for creating multi-speaker interactions easily:
 
 *   **Dynamic Row Management**: Effortlessly build dialogues by adding (`➕`), cloning (`📋`), or removing (`🗑️`) speaker segments. 
