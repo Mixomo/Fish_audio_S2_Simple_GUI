@@ -1703,6 +1703,23 @@ with gr.Blocks(title="Fish Speech S2 Pro - Voice Clone & Training GUI") as app:
                                 gr.Markdown(f"✅ **Cache Found:** ({_cache_kernel_count} kernels)")
                             else:
                                 gr.Markdown(f"⚠️ **No Cache:** First PyTorch run ~5 min.")
+            
+            with gr.Accordion("ℹ️ Supported Generation Tags & Tips", open=False):
+                gr.Markdown("""
+                **Supported Generation Tags**
+                S2 Pro enables localized control over speech generation by embedding natural-language instructions directly within the text using `[tag]` syntax. Rather than relying on a fixed set of predefined tags, S2 Pro accepts free-form textual descriptions - such as `[whisper in small voice]`, `[professional broadcast tone]`, or `[pitch up]` - allowing open-ended expression control at the word level.
+                
+                **Common tags (15,000+ unique tags supported):**
+                `[pause]` `[emphasis]` `[laughing]` `[inhale]` `[chuckle]` `[tsk]` `[singing]` `[excited]` `[laughing tone]` `[interrupting]` `[chuckling]` `[excited tone]` `[volume up]` `[echo]` `[angry]` `[low volume]` `[sigh]` `[low voice]` `[whisper]` `[screaming]` `[shouting]` `[loud]` `[surprised]` `[short pause]` `[exhale]` `[delight]` `[panting]` `[audience laughter]` `[with strong accent]` `[volume down]` `[clearing throat]` `[sad]` `[moaning]` `[shocked]` and much more...
+                """)
+            
+            with gr.Accordion("🌐 Supported Languages", open=False):
+                gr.Markdown("""
+                **S2 Pro supports 80+ languages.**
+                *   **Tier 1:** Japanese (ja), English (en), Chinese (zh)
+                *   **Tier 2:** Korean (ko), Spanish (es), Portuguese (pt), Arabic (ar), Russian (ru), French (fr), German (de)
+                *   **Other supported languages:** sv, it, tr, no, nl, cy, eu, ca, da, gl, ta, hu, fi, pl, et, hi, la, ur, th, vi, jw, bn, yo, xsl, cs, sw, nn, he, ms, uk, id, kk, bg, lv, my, tl, sk, ne, fa, af, el, bo, hr, ro, sn, mi, yi, am, be, km, is, az, sd, br, sq, ps, mn, ht, ml, sr, sa, te, ka, bs, pa, lt, kn, si, hy, mr, as, gu, fo, and more.
+                """)
 
             with gr.Tabs():
                 with gr.Tab("Single Inference"):
