@@ -2,6 +2,16 @@ import gradio as gr
 import subprocess
 import os
 import time
+
+# --- PERSISTENT CACHE CONFIGURATION (Must be set BEFORE importing torch) ---
+ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
+MODELS_DIR = os.path.join(ROOT_DIR, "models")
+COMPILE_CACHE_DIR = os.path.join(MODELS_DIR, ".cache")
+os.makedirs(COMPILE_CACHE_DIR, exist_ok=True)
+os.environ["TORCHINDUCTOR_CACHE_DIR"] = COMPILE_CACHE_DIR
+os.environ["TRITON_CACHE_DIR"] = COMPILE_CACHE_DIR
+os.environ["TORCHINDUCTOR_FX_GRAPH_CACHE"] = "1"
+
 import torch
 import shutil
 import requests
@@ -29,7 +39,6 @@ def play_done_chime():
         winsound.MessageBeep()
 
 # Main Paths
-ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 CPP_EXEC = os.path.join(ROOT_DIR, "modules", "s2.cpp", "build", "Release", "s2.exe")
 if not os.path.exists(CPP_EXEC):
     CPP_EXEC = os.path.join(ROOT_DIR, "modules", "s2.cpp", "build", "s2.exe")
@@ -58,7 +67,6 @@ fish_python_decode_one_token = None
 fish_python_checkpoint_dir = None
 
 # Model directories (organized per user request)
-MODELS_DIR = os.path.join(ROOT_DIR, "models")
 FISH_MODELS_DIR = os.path.join(MODELS_DIR, "S2")
 S2_CPP_MODELS_DIR = os.path.join(MODELS_DIR, "s2.cpp")
 TRAINED_MODELS_DIR = os.path.join(MODELS_DIR, "trained_models")
@@ -66,22 +74,13 @@ WHISPER_MODELS_DIR = os.path.join(MODELS_DIR, "whisper")
 OUTPUTS_DIR = os.path.join(ROOT_DIR, "outputs")
 SAMPLES_DIR = os.path.join(ROOT_DIR, "samples")
 
-for d in [OUTPUTS_DIR, MODELS_DIR, FISH_MODELS_DIR, S2_CPP_MODELS_DIR, SAMPLES_DIR, TRAINED_MODELS_DIR, WHISPER_MODELS_DIR]:
+for d in [OUTPUTS_DIR, MODELS_DIR, FISH_MODELS_DIR, S2_CPP_MODELS_DIR, SAMPLES_DIR, TRAINED_MODELS_DIR, WHISPER_MODELS_DIR, COMPILE_CACHE_DIR]:
     os.makedirs(d, exist_ok=True)
-
-# Persistent Cache for torch.compile (Inductor / Triton)
-# This prevents recompilation on every restart
-CACHE_DIR = os.path.join(MODELS_DIR, ".cache")
-os.makedirs(CACHE_DIR, exist_ok=True)
-os.environ["TORCHINDUCTOR_CACHE_DIR"] = CACHE_DIR
-os.environ["TRITON_CACHE_DIR"] = CACHE_DIR
-# Optimization flag to cache FX graphs
-os.environ["TORCHINDUCTOR_FX_GRAPH_CACHE"] = "1"
 
 # --- Startup: Cache Status Report ---
 _cache_kernel_count = 0
 try:
-    _cache_kernel_count = sum(1 for _, _, files in os.walk(CACHE_DIR) for f in files if f.endswith('.py'))
+    _cache_kernel_count = sum(1 for _, _, files in os.walk(COMPILE_CACHE_DIR) for f in files if f.endswith('.py'))
 except Exception:
     pass
 
@@ -830,6 +829,8 @@ def generate_dialogue(engine, cpp_model_str, trained_model_select, top_p, top_k,
         
         if wav_path and os.path.exists(wav_path):
             audio_data, sr = sf.read(wav_path)
+            # Normalize each speaker individually before concatenation
+            audio_data = process_audio_array(audio_data)
             final_sr = sr
             all_audio_segments.append(audio_data.astype(np.float32))
             
