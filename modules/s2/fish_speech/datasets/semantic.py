@@ -41,6 +41,9 @@ def split_by_rank_worker(files):
     if worker_info is not None:
         total_devices *= worker_info.num_workers
 
+    if len(files) == 0:
+        return []
+
     if len(files) < total_devices:
         # Repeat the files N times to match the number of devices
         files = files * (total_devices // len(files) + 1)

@@ -217,7 +217,7 @@ uv pip install descript-audiotools descript-audio-codec --no-deps
 uv pip install argbind pyloudnorm julius ffmpy ipython matplotlib pystoi torch-stoi markdown2 randomname importlib_resources
 # Step 3: Install the remaining dependencies normally
 
-uv pip install "protobuf>=4.21.0" soundfile librosa numpy "pydantic>=2.0" faster-whisper ctranslate2 huggingface_hub hf-xet loralib gradio loguru transformers datasets lightning hydra-core tensorboard natsort einops rich wandb grpcio kui uvicorn pyrootutils resampy einx zstandard pydub pyaudio modelscope opencc-python-reimplemented silero-vad ormsgpack tiktoken cachetools safetensors google-genai deepgram-sdk pyannote.audio flatten_dict
+uv pip install "protobuf>=4.21.0" soundfile librosa numpy "pydantic>=2.0" faster-whisper ctranslate2 huggingface_hub hf-xet loralib gradio loguru transformers datasets lightning hydra-core tensorboard natsort einops rich wandb grpcio kui uvicorn pyrootutils resampy einx zstandard pydub pyaudio modelscope opencc-python-reimplemented silero-vad ormsgpack tiktoken cachetools safetensors google-genai deepgram-sdk pyannote.audio flatten_dict torchcodec
 
 
 

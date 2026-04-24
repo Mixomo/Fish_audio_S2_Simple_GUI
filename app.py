@@ -1,7 +1,8 @@
 import gradio as gr
-import subprocess
 import os
+import subprocess
 import time
+from pathlib import Path
 
 # --- PERSISTENT CACHE CONFIGURATION (Must be set BEFORE importing torch) ---
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -99,9 +100,6 @@ SAMPLES_DIR = os.path.join(ROOT_DIR, "samples")
 for d in [OUTPUTS_DIR, MODELS_DIR, FISH_MODELS_DIR, S2_CPP_MODELS_DIR, SAMPLES_DIR, TRAINED_MODELS_DIR, WHISPER_MODELS_DIR, COMPILE_CACHE_DIR]:
     os.makedirs(d, exist_ok=True)
 
-# Set env vars BEFORE any torch.compile call to enable persistent kernel caching
-os.environ["TORCH_LOGS"] = os.environ.get("TORCH_LOGS", "")  # Preserve existing logs config
-
 # --- Startup: Cache Status Report ---
 _cache_kernel_count = 0
 try:
@@ -138,6 +136,21 @@ GGUF_MODELS = {
     "Q4_K_M [Vulkan/CPU - Not Supported under WSL2] (3-4GB VRAM) ~4GB Decent": "s2-pro-q4_k_m.gguf",
     "Q3_K [Vulkan/CPU - Not Supported under WSL2] ~3GB Low Quality": "s2-pro-q3_k.gguf",
     "Q2_K [Vulkan/CPU - Not Supported under WSL2] <3GB Very Low Quality": "s2-pro-q2_k.gguf"
+}
+
+WHISPER_MODELS = {
+    "large-v3 (~10 GB VRAM)": "large-v3",
+    "large-v2 (~10 GB VRAM)": "large-v2",
+    "medium (~5 GB VRAM)": "medium",
+    "small (~2 GB VRAM)": "small",
+    "base (~1 GB VRAM)": "base"
+}
+
+WHISPER_LANGS = {
+    "Auto-detect": None,
+    "English": "en", "Spanish": "es", "French": "fr", "German": "de", "Italian": "it",
+    "Portuguese": "pt", "Russian": "ru", "Turkish": "tr", "Japanese": "ja", "Korean": "ko",
+    "Chinese": "zh", "Arabic": "ar", "Dutch": "nl", "Greek": "el", "Polish": "pl"
 }
 # GPU backend selection:
 #   F16, Q8_0       -> CUDA (-c 0) — native CUDA get_rows support
@@ -890,7 +903,8 @@ def transcribe_only(audio_path, model_size, language_name, progress=gr.Progress(
         os.makedirs(whisper_cache, exist_ok=True)
         
         compute_type = "float16" if device == "cuda" else "int8"
-        model = WhisperModel(model_size, device=device, compute_type=compute_type, download_root=whisper_cache)
+        model_id = WHISPER_MODELS.get(model_size, model_size)
+        model = WhisperModel(model_id, device=device, compute_type=compute_type, download_root=whisper_cache)
         
         progress(0.5, desc="Transcribing audio...")
         segments, info = model.transcribe(audio_path, language=lang_code, beam_size=5)
@@ -919,10 +933,9 @@ def handle_full_batch_process(source_folder, dataset_name, model_size, language_
         return "Error: Please provide a target dataset name."
 
     import glob
-    audio_files = []
-    for ext in ["*.wav", "*.mp3", "*.flac", "*.m4a", "*.ogg"]:
-        audio_files.extend(glob.glob(os.path.join(source_folder, ext)))
-        audio_files.extend(glob.glob(os.path.join(source_folder, ext.upper())))
+    all_files = glob.glob(os.path.join(source_folder, "*.*"))
+    audio_extensions = (".wav", ".mp3", ".flac", ".m4a", ".ogg")
+    audio_files = [f for f in all_files if f.lower().endswith(audio_extensions)]
     
     if not audio_files:
         return "Error: No audio files found in the source folder."
@@ -982,7 +995,8 @@ def handle_full_batch_process(source_folder, dataset_name, model_size, language_
         os.makedirs(whisper_cache, exist_ok=True)
         
         compute_type = "float16" if device == "cuda" else "int8"
-        model = WhisperModel(model_size, device=device, compute_type=compute_type, download_root=whisper_cache)
+        model_id = WHISPER_MODELS.get(model_size, model_size)
+        model = WhisperModel(model_id, device=device, compute_type=compute_type, download_root=whisper_cache)
         batched_model = BatchedInferencePipeline(model=model)
         
         target_files = glob.glob(os.path.join(target_dir, "*.wav"))
@@ -1091,10 +1105,9 @@ def fix_audio_batch(folder_path, normalize=True, to_mono=True, progress=gr.Progr
         return "Please provide a valid folder path."
         
     import glob
-    audio_files = []
-    for ext in ["*.wav", "*.mp3", "*.flac", "*.m4a", "*.ogg"]:
-        audio_files.extend(glob.glob(os.path.join(folder_path, ext)))
-        audio_files.extend(glob.glob(os.path.join(folder_path, ext.upper())))
+    all_files = glob.glob(os.path.join(folder_path, "*.*"))
+    audio_extensions = (".wav", ".mp3", ".flac", ".m4a", ".ogg")
+    audio_files = [f for f in all_files if f.lower().endswith(audio_extensions)]
     
     if not audio_files:
         return "No audio files found."
@@ -1294,8 +1307,12 @@ def handle_lora_unified(output_name, model_name, max_steps, lr, vram_preset, lor
 
     dataset_dir = os.path.join(TRAINING_DATA_DIR, output_name)
     proto_dir = os.path.join(dataset_dir, "protos")
-    if not os.path.exists(proto_dir):
-        msg_log.append(f"Sharded data not found at {proto_dir}. Sharding might have failed silently.")
+    
+    # Check if sharding produced any data
+    proto_files = list(Path(proto_dir).rglob("*.protos")) + list(Path(proto_dir).rglob("*.proto"))
+    if not proto_files:
+        msg_log.append(f"❌ Error: No sharded data (.protos) found in {proto_dir}.")
+        msg_log.append("This usually means VQ Extraction or Sharding failed to find your audios/transcripts.")
         return "\n".join(msg_log)
         
     if not model_name:
@@ -1349,7 +1366,6 @@ def handle_lora_unified(output_name, model_name, max_steps, lr, vram_preset, lor
         f"{resume_flags}"
         f"+lora@model.model.lora_config={lora_config_name} "
         f"trainer.max_steps={int(max_steps)} "
-        f"model.lr_scheduler.T_max={int(max_steps)} "
         f"trainer.accumulate_grad_batches={acc_grad} "
         f"data.batch_size={bs} "
         f"model.optimizer.lr={float(lr)} "
@@ -1359,7 +1375,6 @@ def handle_lora_unified(output_name, model_name, max_steps, lr, vram_preset, lor
         f"pretrained_ckpt_path=\"{ckpt_dir_abs}\" "
         f"train_dataset.proto_files=[{proto_dir_abs}] "
         f"val_dataset.proto_files=[{proto_dir_abs}] "
-        f"~callbacks.audio_sample "
         f"trainer.val_check_interval={int(save_every)} "
         f"callbacks.model_checkpoint.every_n_train_steps={int(save_every)} "
         f"callbacks.model_checkpoint.save_last=True "
@@ -1672,6 +1687,20 @@ with gr.Blocks(title="Fish Speech S2 Pro - Voice Clone & Training GUI") as app:
                             )
                             trained_model_refresh_btn = gr.Button("🔄", scale=1, min_width=50)
 
+                    with gr.Row():
+                        infer_whisper_model = gr.Dropdown(
+                            choices=list(WHISPER_MODELS.keys()), 
+                            value="large-v3 (~10 GB VRAM)", 
+                            label="Whisper Model Size",
+                            scale=1
+                        )
+                        infer_whisper_language = gr.Dropdown(
+                            choices=list(WHISPER_LANGS.keys()),
+                            value="Auto-detect",
+                            label="Language",
+                            scale=1
+                        )
+
                 with gr.Column(scale=1):
                     gr.Markdown("### 🛠️ Advanced Settings")
                     with gr.Row():
@@ -1800,13 +1829,13 @@ with gr.Blocks(title="Fish Speech S2 Pro - Voice Clone & Training GUI") as app:
                     
                     gr.Markdown("### Transcription Settings")
                     with gr.Row():
-                        whisper_model_size = gr.Dropdown(
-                            choices=["large-v3", "large-v2", "medium", "small", "base"], 
-                            value="large-v3", 
+                        prep_whisper_model = gr.Dropdown(
+                            choices=list(WHISPER_MODELS.keys()), 
+                            value="large-v3 (~10 GB VRAM)", 
                             label="Whisper Model Size",
                             scale=1
                         )
-                        whisper_language = gr.Dropdown(
+                        prep_whisper_language = gr.Dropdown(
                             choices=list(WHISPER_LANGS.keys()),
                             value="Auto-detect",
                             label="Language",
@@ -1974,7 +2003,7 @@ with gr.Blocks(title="Fish Speech S2 Pro - Voice Clone & Training GUI") as app:
                     
                     transcribe_btn.click(
                         fn=transcribe_only,
-                        inputs=[prep_audio_editor, whisper_model_size, whisper_language],
+                        inputs=[prep_audio_editor, prep_whisper_model, prep_whisper_language],
                         outputs=[transcription_output]
                     )
 
@@ -1992,7 +2021,7 @@ with gr.Blocks(title="Fish Speech S2 Pro - Voice Clone & Training GUI") as app:
                     
                     batch_process_btn.click(
                         fn=handle_full_batch_process,
-                        inputs=[batch_folder_input, batch_dataset_name, whisper_model_size, whisper_language, faster_whisper_batch],
+                        inputs=[batch_folder_input, batch_dataset_name, prep_whisper_model, prep_whisper_language, faster_whisper_batch],
                         outputs=[batch_status]
                     )
 
@@ -2138,5 +2167,18 @@ with gr.Blocks(title="Fish Speech S2 Pro - Voice Clone & Training GUI") as app:
                 outputs=[model_name_input]
             )
 
+            # --- Synchronize all Whisper components across tabs ---
+            all_whisper_models = [infer_whisper_model, prep_whisper_model]
+            all_whisper_langs = [infer_whisper_language, prep_whisper_language]
+
+            def sync_w_model(val): return [gr.update(value=val)] * 2
+            def sync_w_lang(val): return [gr.update(value=val)] * 2
+
+            for m in all_whisper_models:
+                m.change(sync_w_model, inputs=[m], outputs=all_whisper_models)
+            for l in all_whisper_langs:
+                l.change(sync_w_lang, inputs=[l], outputs=all_whisper_langs)
+
 if __name__ == "__main__":
+
     app.launch(server_name="127.0.0.1", server_port=7860, inbrowser=True, css=CUSTOM_CSS)

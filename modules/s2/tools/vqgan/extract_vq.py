@@ -1,4 +1,5 @@
 import os
+os.environ.pop("TORCH_LOGS", None)
 import subprocess as sp
 import sys
 import time
@@ -99,8 +100,17 @@ def process_batch(files: list[Path], model) -> float:
                 str(file), backend=backend
             )  # Need to install libsox-dev
         except Exception as e:
-            logger.error(f"Error reading {file}: {e}")
-            continue
+            try:
+                import soundfile as sf
+                wav_np, sr = sf.read(str(file))
+                wav = torch.from_numpy(wav_np).float()
+                if wav.ndim == 1:
+                    wav = wav[None, :]
+                else:
+                    wav = wav.T
+            except Exception as e2:
+                logger.error(f"Error reading {file} with fallback: {e2}")
+                continue
 
         if wav.shape[0] > 1:
             wav = wav.mean(dim=0, keepdim=True)
@@ -118,6 +128,9 @@ def process_batch(files: list[Path], model) -> float:
     # Pad to max length
     for i, wav in enumerate(wavs):
         wavs[i] = torch.nn.functional.pad(wav, (0, max_length - len(wav)), "constant")
+
+    if not wavs:
+        return 0.0
 
     audios = torch.stack(wavs, dim=0)[:, None]
     audio_lengths = torch.tensor(audio_lengths, device=model.device, dtype=torch.long)
