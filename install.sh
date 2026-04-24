@@ -173,7 +173,7 @@ if command -v nvcc &> /dev/null || [ -d "/usr/local/cuda" ]; then
         if command -v ninja &> /dev/null; then GENERATOR="Ninja"; fi
         
         # CPU Optimization flags for Linux (O3, march=native, OpenMP)
-        export CXXFLAGS="-O3 -march=native -ffast-math -fopenmp -DNDEBUG"
+        export CXXFLAGS="-O3 -march=native -ffast-math -fno-finite-math-only -fopenmp -DNDEBUG"
         export LDFLAGS="-fopenmp"
 
         Write-Info "Configuring and Building S2.cpp with $GENERATOR (O3 Optimized)..."

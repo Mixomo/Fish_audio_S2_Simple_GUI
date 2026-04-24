@@ -2,6 +2,16 @@ import gradio as gr
 import subprocess
 import os
 import time
+
+# --- PERSISTENT CACHE CONFIGURATION (Must be set BEFORE importing torch) ---
+ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
+MODELS_DIR = os.path.join(ROOT_DIR, "models")
+COMPILE_CACHE_DIR = os.path.join(MODELS_DIR, ".cache")
+os.makedirs(COMPILE_CACHE_DIR, exist_ok=True)
+os.environ["TORCHINDUCTOR_CACHE_DIR"] = COMPILE_CACHE_DIR
+os.environ["TRITON_CACHE_DIR"] = COMPILE_CACHE_DIR
+os.environ["TORCHINDUCTOR_FX_GRAPH_CACHE"] = "1"
+
 import torch
 import shutil
 import requests
@@ -62,15 +72,6 @@ os.environ["OMP_PLACES"] = "CORES"
 os.environ["OMP_WAIT_POLICY"] = "PASSIVE"
 os.environ["KMP_BLOCKTIME"] = "0"
 
-# Persistent Cache for torch.compile (Inductor / Triton)
-# This prevents recompilation on every restart
-MODELS_DIR = os.path.join(ROOT_DIR, "models")
-CACHE_DIR = os.path.join(MODELS_DIR, ".cache")
-os.makedirs(CACHE_DIR, exist_ok=True)
-os.environ["TORCHINDUCTOR_CACHE_DIR"] = CACHE_DIR
-os.environ["TRITON_CACHE_DIR"] = CACHE_DIR
-os.environ["TORCHINDUCTOR_FX_GRAPH_CACHE"] = "1"
-
 s2_process = None
 s2_current_model = None
 training_process = None
@@ -88,7 +89,6 @@ fish_python_decode_one_token = None
 fish_python_checkpoint_dir = None
 
 # Model directories (organized per user request)
-MODELS_DIR = os.path.join(ROOT_DIR, "models")
 FISH_MODELS_DIR = os.path.join(MODELS_DIR, "S2")
 S2_CPP_MODELS_DIR = os.path.join(MODELS_DIR, "s2.cpp")
 TRAINED_MODELS_DIR = os.path.join(MODELS_DIR, "trained_models")
@@ -96,16 +96,10 @@ WHISPER_MODELS_DIR = os.path.join(MODELS_DIR, "whisper")
 OUTPUTS_DIR = os.path.join(ROOT_DIR, "outputs")
 SAMPLES_DIR = os.path.join(ROOT_DIR, "samples")
 
-# Persistent torch.compile / Inductor cache (avoids re-autotuning on every launch)
-COMPILE_CACHE_DIR = os.path.join(ROOT_DIR, ".cache", "torch_compile")
-
 for d in [OUTPUTS_DIR, MODELS_DIR, FISH_MODELS_DIR, S2_CPP_MODELS_DIR, SAMPLES_DIR, TRAINED_MODELS_DIR, WHISPER_MODELS_DIR, COMPILE_CACHE_DIR]:
     os.makedirs(d, exist_ok=True)
 
 # Set env vars BEFORE any torch.compile call to enable persistent kernel caching
-os.environ["TORCHINDUCTOR_CACHE_DIR"] = COMPILE_CACHE_DIR
-os.environ["TRITON_CACHE_DIR"] = COMPILE_CACHE_DIR
-os.environ["TORCHINDUCTOR_FX_GRAPH_CACHE"] = "1"
 os.environ["TORCH_LOGS"] = os.environ.get("TORCH_LOGS", "")  # Preserve existing logs config
 
 # --- Startup: Cache Status Report ---
@@ -117,7 +111,7 @@ except Exception:
 
 print("----------------------------------------------------------------")
 if _cache_kernel_count >= 50:
-    print(f"[Fish Speech] Persistent cache found at {COMPILE_CACHE_DIR} ({_cache_kernel_count} compiled kernels).")
+    print(f"[Fish Speech] Persistent cache found at models/.cache ({_cache_kernel_count} compiled kernels).")
     print("[Fish Speech] PyTorch engine will use cached kernels — fast startup expected.")
 else:
     print(f"[Fish Speech] No persistent cache found (or incomplete: {_cache_kernel_count} kernels).")
@@ -431,6 +425,19 @@ def generate_fish_python(text, ref_audio, ref_text, top_p, top_k, temp, rep_pen,
     audio_int16 = (audio_np * 32767).astype(np.int16)
     return sample_rate, audio_int16
 
+def process_audio_array(audio_data):
+    """Converts audio to mono and normalizes volume to [-1, 1]"""
+    # Convert to mono if stereo
+    if len(audio_data.shape) > 1 and audio_data.shape[1] > 1:
+        audio_data = np.mean(audio_data, axis=1)
+    
+    # Normalize volume
+    max_val = np.max(np.abs(audio_data))
+    if max_val > 0:
+        audio_data = audio_data / max_val
+        
+    return audio_data
+
 def clone_voice(engine, cpp_model_str, trained_model_select, text, ref_audio, ref_text, top_p, top_k, temp, rep_pen, split_by_paragraph, progress=gr.Progress()):
     global s2_process, s2_current_model
 
@@ -676,6 +683,10 @@ def clone_voice(engine, cpp_model_str, trained_model_select, text, ref_audio, re
             # Concatenate all segments
             if all_audio_segments:
                 combined_audio = np.concatenate(all_audio_segments)
+                
+                # Convert to mono and normalize
+                combined_audio = process_audio_array(combined_audio)
+                
                 # Convert to int16 for Gradio consistency
                 audio_int16 = (combined_audio * 32767).astype(np.int16)
                 import soundfile as sf
@@ -711,6 +722,10 @@ def clone_voice(engine, cpp_model_str, trained_model_select, text, ref_audio, re
                     
                 import soundfile as sf
                 audio_data, sr = sf.read(io.BytesIO(res.content))
+                
+                # Convert to mono and normalize
+                audio_data = process_audio_array(audio_data)
+                
                 # Apply fix for Gradio: convert to int16
                 audio_int16 = (audio_data * 32767).astype(np.int16)
                 sf.write(out_wav, audio_int16, sr)
@@ -767,6 +782,12 @@ def clone_voice(engine, cpp_model_str, trained_model_select, text, ref_audio, re
                 print("[Fish Speech] Subsequent generations will be significantly faster.")
                 
             sr, audio_int16 = generate_fish_python(text, ref_audio, ref_text, top_p, top_k, temp, rep_pen, split_by_paragraph, trained_model_select, progress=progress)
+            
+            # Convert to float32 to process, then back
+            audio_data = audio_int16.astype(np.float32) / 32767.0
+            audio_data = process_audio_array(audio_data)
+            audio_int16 = (audio_data * 32767).astype(np.int16)
+            
             progress(0.9, desc="Saving audio...")
             sf.write(out_wav, audio_int16, sr)
             play_done_chime()
@@ -783,6 +804,72 @@ def clone_voice(engine, cpp_model_str, trained_model_select, text, ref_audio, re
             return None, f"Error generating with PyTorch: {str(e)}"
 
     return None, "Engine not supported."
+
+def generate_dialogue(engine, cpp_model_str, trained_model_select, top_p, top_k, temp, rep_pen, split_para, row_count, silence_duration, *args, progress=gr.Progress()):
+    # args is [sample1, ..., sample20, text1, ..., text20]
+    num_max = 20 # Should match MAX_DIALOGUE_SEGMENTS
+    samples = args[:num_max]
+    texts = args[num_max:]
+    
+    segments = []
+    for i in range(int(row_count)):
+        s = samples[i]
+        t = texts[i]
+        if s and t:
+            segments.append((s, t))
+            
+    if not segments:
+        return None, "Please add at least one speaker and text."
+        
+    all_audio_segments = []
+    final_sr = 32000
+    
+    for i, (sample_name, text) in enumerate(segments):
+        progress((i / len(segments)), desc=f"Processing segment {i+1}/{len(segments)} ({sample_name})...")
+        
+        # Load sample
+        ref_audio, ref_text = load_sample(sample_name)
+        if not ref_audio:
+            print(f"Sample {sample_name} not found, skipping segment {i+1}")
+            continue
+            
+        # Generate
+        wav_path, status = clone_voice(
+            engine, cpp_model_str, trained_model_select, text, ref_audio, ref_text, 
+            top_p, top_k, temp, rep_pen, split_para, progress=progress
+        )
+        
+        if wav_path and os.path.exists(wav_path):
+            audio_data, sr = sf.read(wav_path)
+            # Normalize each speaker individually before concatenation
+            audio_data = process_audio_array(audio_data)
+            final_sr = sr
+            all_audio_segments.append(audio_data.astype(np.float32))
+            
+            # Add silence between speakers
+            if silence_duration > 0:
+                silence = np.zeros(int(sr * silence_duration), dtype=np.float32)
+                all_audio_segments.append(silence)
+        else:
+            return None, f"Error in segment {i+1} ({sample_name}): {status}"
+            
+    if all_audio_segments:
+        # Concatenate (exclude last silence if added)
+        if silence_duration > 0 and len(all_audio_segments) > 1:
+            combined = np.concatenate(all_audio_segments[:-1])
+        else:
+            combined = np.concatenate(all_audio_segments)
+            
+        combined = process_audio_array(combined)
+            
+        # Output file
+        out_wav = os.path.join(OUTPUTS_DIR, f"dialogue_{int(time.time()*1000)}.wav")
+        # Gradio fix: int16
+        audio_int16 = (combined * 32767).astype(np.int16)
+        sf.write(out_wav, audio_int16, final_sr)
+        return out_wav, f"Dialogue generated successfully with {len(segments)} segments!"
+    
+    return None, "No audio generated."
 
 def transcribe_only(audio_path, model_size, language_name, progress=gr.Progress()):
     if not audio_path:
@@ -1466,6 +1553,11 @@ _sample_choices = get_sample_choices()
 _default_sample = _sample_choices[0] if _sample_choices else None
 _default_audio, _default_text = load_sample(_default_sample)
 
+CUSTOM_CSS = """
+.green-btn { background-color: #28a745 !important; color: white !important; border: none !important; }
+.red-btn { background-color: #dc3545 !important; color: white !important; border: none !important; }
+"""
+
 with gr.Blocks(title="Fish Speech S2 Pro - Voice Clone & Training GUI") as app:
     with gr.Row():
         with gr.Column(scale=20):
@@ -1488,87 +1580,191 @@ with gr.Blocks(title="Fish Speech S2 Pro - Voice Clone & Training GUI") as app:
                 return " "
             unload_all_btn.click(clear_vram, outputs=[unload_status]).then(clear_vram_msg, outputs=[unload_status])
 
+    def add_dialogue_row_at(index, count, *args):
+        num = 20
+        samples = list(args[:num])
+        texts = list(args[num:])
+        if count < num:
+            samples.insert(index + 1, samples[index])
+            texts.insert(index + 1, "")
+            samples.pop()
+            texts.pop()
+            count += 1
+        
+        update_samples = [gr.update(value=samples[i], visible=(i < count)) for i in range(num)]
+        update_texts = [gr.update(value=texts[i], visible=(i < count)) for i in range(num)]
+        update_rows = [gr.update(visible=(i < count)) for i in range(num)]
+        return [count] + update_samples + update_texts + update_rows
+
+    def rem_dialogue_row_at(index, count, *args):
+        num = 20
+        samples = list(args[:num])
+        texts = list(args[num:])
+        if count > 1:
+            samples.pop(index)
+            texts.pop(index)
+            samples.append(None)
+            texts.append("")
+            count -= 1
+            
+        update_samples = [gr.update(value=samples[i], visible=(i < count)) for i in range(num)]
+        update_texts = [gr.update(value=texts[i], visible=(i < count)) for i in range(num)]
+        update_rows = [gr.update(visible=(i < count)) for i in range(num)]
+        return [count] + update_samples + update_texts + update_rows
+
+    def clone_dialogue_row_at(index, count, *args):
+        num = 20
+        samples = list(args[:num])
+        texts = list(args[num:])
+        if count < num:
+            samples.insert(index + 1, samples[index])
+            texts.insert(index + 1, texts[index])
+            samples.pop()
+            texts.pop()
+            count += 1
+            
+        update_samples = [gr.update(value=samples[i], visible=(i < count)) for i in range(num)]
+        update_texts = [gr.update(value=texts[i], visible=(i < count)) for i in range(num)]
+        update_rows = [gr.update(visible=(i < count)) for i in range(num)]
+        return [count] + update_samples + update_texts + update_rows
+
     with gr.Tabs(elem_id="main-tabs"):
         with gr.Tab("Voice Clone", id="tab_voice_clone"):
             gr.Markdown("Clone Voices from Samples. <small>(Use Prep Samples to add samples)</small>")
+            
+            def update_engine_ui(engine):
+                is_cpp = (engine == ENGINE_CPP)
+                if is_cpp:
+                    return gr.update(visible=True), gr.update(visible=False)
+                else:
+                    return gr.update(visible=False), gr.update(visible=True)
+
+            def update_split_count(text):
+                if not text: return "### ✂️ Splits\n**0** Clips"
+                paragraphs = [p.strip() for p in text.split('\n') if p.strip()]
+                count = len(paragraphs)
+                return f"### ✂️ Splits\n**{count}** {'Clip' if count == 1 else 'Clips'}"
+
+            # --- Global Settings at Top ---
             with gr.Row():
                 with gr.Column(scale=1):
-                    gr.Markdown("### Voice Sample")
-                    with gr.Row():
-                        vc_sample_dropdown = gr.Dropdown(
-                            choices=_sample_choices,
-                            value=_default_sample,
-                            label="Select Sample",
-                            interactive=True,
-                            scale=10
-                        )
-                        vc_sample_refresh_btn = gr.Button("🔄", scale=1, min_width=50)
-                    vc_sample_audio = gr.Audio(label="Sample Preview", type="filepath", interactive=False, elem_id="sample-audio-player", value=_default_audio)
-                    vc_sample_text = gr.Textbox(label="Sample Text", interactive=False, max_lines=10, value=_default_text)
-
-                with gr.Column(scale=3):
-                    gr.Markdown("### Generate Speech")
-                    target_text = gr.Textbox(
-                        label="Text to Generate",
-                        placeholder="Enter the text you want to speak in the cloned voice...",
-                        lines=6
-                    )
-                    
-                    # Cache status notification (VoxCPM pattern)
-                    if HAS_COMPILE_CACHE:
-                        gr.Markdown(f"✅ **Persistent Cache Detected:** PyTorch engine will start fast.")
-                    else:
-                        gr.Markdown(f"⚠️ **No Compilation Cache:** First PyTorch run will take ~5 minutes to compile kernels. Subsequent runs will be instant.")
-
+                    gr.Markdown("### ⚙️ Inference & Models")
                     engine_dropdown = gr.Dropdown(
                         choices=[ENGINE_CPP, ENGINE_PYTORCH],
                         value=ENGINE_CPP,
                         label="Inference Engine"
                     )
-                    cpp_model_row = gr.Row(visible=True)
-                    with cpp_model_row:
-                        cpp_model_dropdown = gr.Dropdown(
-                            choices=list(GGUF_MODELS.keys()), 
-                            label="GGUF Model Quantization", 
-                            value=list(GGUF_MODELS.keys())[1]
-                        )
-                    trained_model_row = gr.Row(visible=False)
-                    with trained_model_row:
-                        trained_model_dropdown = gr.Dropdown(
-                            choices=get_trained_models(),
-                            label="Trained LoRA Model",
-                            value="Base Model (Fish S2 Pro)",
-                            scale=10
-                        )
-                        trained_model_refresh_btn = gr.Button("🔄", scale=1, min_width=50)
-                        
-                    def update_engine_ui(engine):
-                        is_cpp = (engine == ENGINE_CPP)
-                        if is_cpp:
-                            return gr.update(visible=True), gr.update(visible=False)
-                        else:
-                            models = get_trained_models()
-                            return gr.update(visible=False), gr.update(visible=True)
+                    with gr.Row():
+                        cpp_model_row = gr.Row(visible=True)
+                        with cpp_model_row:
+                            cpp_model_dropdown = gr.Dropdown(
+                                choices=list(GGUF_MODELS.keys()), 
+                                label="GGUF Model", 
+                                value=list(GGUF_MODELS.keys())[1]
+                            )
+                        trained_model_row = gr.Row(visible=False)
+                        with trained_model_row:
+                            trained_model_dropdown = gr.Dropdown(
+                                choices=get_trained_models(),
+                                label="Trained LoRA Model",
+                                value="Base Model (Fish S2 Pro)",
+                                scale=10
+                            )
+                            trained_model_refresh_btn = gr.Button("🔄", scale=1, min_width=50)
 
-                    # Listeners moved to the end of script
+                with gr.Column(scale=1):
+                    gr.Markdown("### 🛠️ Advanced Settings")
+                    with gr.Row():
+                        with gr.Column():
+                            top_p_slider = gr.Slider(0.1, 1.0, value=0.7, step=0.05, label="Top-P")
+                            top_k_slider = gr.Slider(1, 100, value=30, step=1, label="Top-K")
+                        with gr.Column():
+                            temperature_slider = gr.Slider(0.1, 2.0, value=0.7, step=0.1, label="Temperature")
+                            rep_pen_slider = gr.Slider(1.0, 2.0, value=1.2, step=0.05, label="Repetition Penalty")
                     
-                    with gr.Accordion("Advanced Settings", open=False):
-                        top_p_slider = gr.Slider(0.1, 1.0, value=0.7, step=0.05, label="Top-P")
-                        top_k_slider = gr.Slider(1, 100, value=30, step=1, label="Top-K")
-                        temperature_slider = gr.Slider(0.1, 2.0, value=0.7, step=0.1, label="Temperature")
-                        rep_pen_slider = gr.Slider(1.0, 2.0, value=1.2, step=0.05, label="Repetition Penalty")
-                        split_para_check = gr.Checkbox(label="Split by Paragraphs (Recommended for long texts)", value=False)
+                    with gr.Row():
+                        with gr.Column():
+                            split_para_check = gr.Checkbox(label="Split by Paragraphs (Recommended for long texts)", value=False)
+                            gr.Markdown("ℹ️ *To apply splits, you must press **Enter** after each sentence or point where you want a cut; each line break will generate an independent audio clip that will be automatically merged.*")
+                        with gr.Column():
+                            dialogue_silence_slider = gr.Slider(0, 5, value=0.5, step=0.1, label="Silence between speakers (s)")
+                            if HAS_COMPILE_CACHE:
+                                gr.Markdown(f"✅ **Cache Found:** ({_cache_kernel_count} kernels)")
+                            else:
+                                gr.Markdown(f"⚠️ **No Cache:** First PyTorch run ~5 min.")
+
+            with gr.Tabs():
+                with gr.Tab("Single Inference"):
+                    with gr.Row():
+                        with gr.Column(scale=1):
+                            gr.Markdown("### Voice Sample")
+                            with gr.Row():
+                                vc_sample_dropdown = gr.Dropdown(
+                                    choices=_sample_choices,
+                                    value=_default_sample,
+                                    label="Select Sample",
+                                    interactive=True,
+                                    scale=10
+                                )
+                                vc_sample_refresh_btn = gr.Button("🔄", scale=1, min_width=50)
+                            vc_sample_audio = gr.Audio(label="Sample Preview", type="filepath", interactive=False, elem_id="sample-audio-player", value=_default_audio)
+                            vc_sample_text = gr.Textbox(label="Sample Text", interactive=False, max_lines=10, value=_default_text)
+
+                        with gr.Column(scale=2):
+                            gr.Markdown("### Generate Speech")
+                            with gr.Row():
+                                target_text = gr.Textbox(
+                                    label="Text to Generate",
+                                    placeholder="Enter text to speak...",
+                                    lines=6,
+                                    scale=10
+                                )
+                                with gr.Column(scale=1, min_width=100):
+                                    split_counter_display = gr.Markdown("### ✂️ Splits\n**1** Clip", elem_id="split-counter", visible=False)
+
+                            with gr.Row():
+                                generate_btn = gr.Button("Generate Audio 🚀", variant="primary", size="lg")
+                            
+                            with gr.Row():
+                                output_audio = gr.Audio(label="Generated Audio", type="filepath")
+                            
+                            with gr.Row():
+                                clone_status = gr.Textbox(label="Status", interactive=False, lines=2)
+
+                with gr.Tab("Dialogue Builder"):
+                    gr.Markdown("### 💬 Multi-Speaker Dialogue Builder")
+                    dialogue_segments = []
+                    MAX_DIALOGUE_SEGMENTS = 20
+                    
+                    with gr.Column():
+                        for i in range(MAX_DIALOGUE_SEGMENTS):
+                            with gr.Row(visible=(i < 2)) as row:
+                                s = gr.Dropdown(choices=_sample_choices, label=f"Speaker {i+1}", scale=3, value=_default_sample if i < 2 else None)
+                                t = gr.Textbox(placeholder=f"Enter text for speaker {i+1}...", label=f"Text {i+1}", scale=7, lines=6)
+                                with gr.Row():
+                                    add_btn = gr.Button("➕", variant="secondary", size="sm", elem_classes=["green-btn"])
+                                    clone_btn = gr.Button("📋", variant="secondary", size="sm")
+                                    rem_btn = gr.Button("🗑️", variant="stop", size="sm", elem_classes=["red-btn"])
+                                
+                                dialogue_segments.append({
+                                    "row": row, 
+                                    "sample": s, 
+                                    "text": t,
+                                    "add": add_btn,
+                                    "clone": clone_btn,
+                                    "rem": rem_btn
+                                })
                         
-                    with gr.Row():
-                        generate_btn = gr.Button("Generate Audio 🚀", variant="primary", size="lg")
+                        dialogue_row_count = gr.State(2)
                         
-                    with gr.Row():
-                        output_audio = gr.Audio(label="Generated Audio", type="filepath")
-                    
-                    with gr.Row():
-                        clone_status = gr.Textbox(label="Status", interactive=False, lines=2, max_lines=5)
-                    
-                    # Listeners moved to the end of script
+                        with gr.Row():
+                            generate_dialogue_btn = gr.Button("Generate Dialogue 🚀", variant="primary", size="lg")
+                        
+                        with gr.Row():
+                            dialogue_output_audio = gr.Audio(label="Generated Dialogue", type="filepath")
+                        
+                        with gr.Row():
+                            dialogue_status = gr.Textbox(label="Status", interactive=False, lines=2)
 
         with gr.Tab("Prep Samples", id="tab_prep_samples"):
             gr.Markdown("Prepare audio samples for voice cloning.")
@@ -1676,10 +1872,55 @@ with gr.Blocks(title="Fish Speech S2 Pro - Voice Clone & Training GUI") as app:
                         outputs=[cpp_model_row, trained_model_row]
                     )
 
+                    target_text.change(
+                        fn=update_split_count,
+                        inputs=target_text,
+                        outputs=split_counter_display
+                    )
+                    
+                    split_para_check.change(
+                        fn=lambda x: gr.update(visible=x),
+                        inputs=split_para_check,
+                        outputs=split_counter_display
+                    )
+
                     generate_btn.click(
                         fn=clone_voice,
                         inputs=[engine_dropdown, cpp_model_dropdown, trained_model_dropdown, target_text, vc_sample_audio, vc_sample_text, top_p_slider, top_k_slider, temperature_slider, rep_pen_slider, split_para_check],
                         outputs=[output_audio, clone_status]
+                    )
+                    
+                    all_samples_ui = [d["sample"] for d in dialogue_segments]
+                    all_texts_ui = [d["text"] for d in dialogue_segments]
+                    all_rows_ui = [d["row"] for d in dialogue_segments]
+
+                    for i, d in enumerate(dialogue_segments):
+                        d["add"].click(
+                            fn=add_dialogue_row_at,
+                            inputs=[gr.State(i), dialogue_row_count, *all_samples_ui, *all_texts_ui],
+                            outputs=[dialogue_row_count] + all_samples_ui + all_texts_ui + all_rows_ui
+                        )
+                        d["rem"].click(
+                            fn=rem_dialogue_row_at,
+                            inputs=[gr.State(i), dialogue_row_count, *all_samples_ui, *all_texts_ui],
+                            outputs=[dialogue_row_count] + all_samples_ui + all_texts_ui + all_rows_ui
+                        )
+                        d["clone"].click(
+                            fn=clone_dialogue_row_at,
+                            inputs=[gr.State(i), dialogue_row_count, *all_samples_ui, *all_texts_ui],
+                            outputs=[dialogue_row_count] + all_samples_ui + all_texts_ui + all_rows_ui
+                        )
+
+                    generate_dialogue_btn.click(
+                        fn=generate_dialogue,
+                        inputs=[
+                            engine_dropdown, cpp_model_dropdown, trained_model_dropdown, 
+                            top_p_slider, top_k_slider, temperature_slider, rep_pen_slider, split_para_check,
+                            dialogue_row_count, dialogue_silence_slider,
+                            *all_samples_ui,
+                            *all_texts_ui
+                        ],
+                        outputs=[dialogue_output_audio, dialogue_status]
                     )
 
                     # 2. Sample Selection & Management
@@ -1881,4 +2122,4 @@ with gr.Blocks(title="Fish Speech S2 Pro - Voice Clone & Training GUI") as app:
             )
 
 if __name__ == "__main__":
-    app.launch(server_name="127.0.0.1", server_port=7860, inbrowser=True)
+    app.launch(server_name="127.0.0.1", server_port=7860, inbrowser=True, css=CUSTOM_CSS)
