@@ -1,7 +1,8 @@
 import gradio as gr
-import subprocess
 import os
+import subprocess
 import time
+from pathlib import Path
 
 # --- PERSISTENT CACHE CONFIGURATION (Must be set BEFORE importing torch) ---
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -136,6 +137,15 @@ WHISPER_LANGS = {
     "Russian": "ru",
     "Portuguese": "pt",
     "Turkish": "tr"
+}
+
+WHISPER_MODELS = {
+    "large-v3 (~10 GB VRAM)": "large-v3",
+    "large-v2 (~10 GB VRAM)": "large-v2",
+    "medium (~5 GB VRAM)": "medium",
+    "small (~2 GB VRAM)": "small",
+    "base (~1 GB VRAM)": "base",
+    "tiny (~1 GB VRAM)": "tiny"
 }
 
 def get_sample_choices():
@@ -910,7 +920,12 @@ def handle_full_batch_process(source_folder, dataset_name, model_size, language_
     audio_files = []
     for ext in ["*.wav", "*.mp3", "*.flac", "*.m4a", "*.ogg"]:
         audio_files.extend(glob.glob(os.path.join(source_folder, ext)))
-        audio_files.extend(glob.glob(os.path.join(source_folder, ext.upper())))
+        # On Windows glob is case-insensitive, on Linux it is not.
+        if os.name != 'nt':
+            audio_files.extend(glob.glob(os.path.join(source_folder, ext.upper())))
+    
+    # Deduplicate paths to avoid x2 dataset size on case-insensitive filesystems
+    audio_files = list(dict.fromkeys(audio_files))
     
     if not audio_files:
         return "Error: No audio files found in the source folder."
@@ -1017,38 +1032,6 @@ def handle_full_batch_process(source_folder, dataset_name, model_size, language_
     return (f"✨ Success! Processed {processed} files.\n"
             f"📍 Location: datasets/{dataset_name}\n"
             f"✅ Actions: Normalized, Mono, Faster-Whisper Transcribed, metadata.csv generated.")
-    
-    moved_count = 0
-    metadata = []
-    
-    for audio_path in audio_files:
-        filename = os.path.basename(audio_path)
-        lab_path = os.path.splitext(audio_path)[0] + ".lab"
-        
-        # Check if .lab exists
-        if not os.path.exists(lab_path):
-            continue
-            
-        with open(lab_path, "r", encoding="utf-8") as f:
-            text = f.read().strip()
-            
-        dest_audio = os.path.join(target_dir, filename)
-        shutil.copy2(audio_path, dest_audio)
-        
-        # In the training pipeline, it expects metadata.csv with: audio_file|text
-        # We'll use absolute path or relative? prepare_dataset.py uses Path(row["audio_file"])
-        # If we put metadata.csv in the same folder, relative should work.
-        metadata.append(f"{dest_audio}|{text}")
-        moved_count += 1
-        
-    # Write metadata.csv
-    metadata_path = os.path.join(target_dir, "metadata.csv")
-    with open(metadata_path, "w", encoding="utf-8") as f:
-        f.write("audio_file|text\n")
-        f.write("\n".join(metadata))
-        
-    progress(1.0, desc="Done!")
-    return f"Successfully copied {moved_count} samples to datasets folder: {target_dir}.\nGenerated metadata.csv."
 
 def fix_audio_single(audio_path, normalize=True, to_mono=True):
     if not audio_path or not os.path.exists(audio_path):
@@ -1304,8 +1287,12 @@ def handle_lora_unified(output_name, model_name, max_steps, lr, vram_preset, lor
 
     dataset_dir = os.path.join(TRAINING_DATA_DIR, output_name)
     proto_dir = os.path.join(dataset_dir, "protos")
-    if not os.path.exists(proto_dir):
-        msg_log.append(f"Sharded data not found at {proto_dir}. Sharding might have failed silently.")
+    
+    # Check if sharding produced any data
+    proto_files = list(Path(proto_dir).rglob("*.protos")) + list(Path(proto_dir).rglob("*.proto"))
+    if not proto_files:
+        msg_log.append(f"❌ Error: No sharded data (.protos) found in {proto_dir}.")
+        msg_log.append("This usually means VQ Extraction or Sharding failed to find your audios/transcripts.")
         return "\n".join(msg_log)
         
     if not model_name:
@@ -1699,10 +1686,23 @@ with gr.Blocks(title="Fish Speech S2 Pro - Voice Clone & Training GUI") as app:
                             gr.Markdown("ℹ️ *To apply splits, you must press **Enter** after each sentence or point where you want a cut; each line break will generate an independent audio clip that will be automatically merged.*")
                         with gr.Column():
                             dialogue_silence_slider = gr.Slider(0, 5, value=0.5, step=0.1, label="Silence between speakers (s)")
-                            if HAS_COMPILE_CACHE:
-                                gr.Markdown(f"✅ **Cache Found:** ({_cache_kernel_count} kernels)")
-                            else:
-                                gr.Markdown(f"⚠️ **No Cache:** First PyTorch run ~5 min.")
+
+                with gr.Column(scale=1):
+                    gr.Markdown("### 🛰️ Transcription (Whisper)")
+                    infer_whisper_model = gr.Dropdown(
+                        choices=list(WHISPER_MODELS.keys()), 
+                        value="large-v3 (~10 GB VRAM)", 
+                        label="Whisper Model Size"
+                    )
+                    infer_whisper_language = gr.Dropdown(
+                        choices=list(WHISPER_LANGS.keys()),
+                        value="Auto-detect",
+                        label="Language"
+                    )
+                    if HAS_COMPILE_CACHE:
+                        gr.Markdown(f"✅ **Cache Found:** ({_cache_kernel_count} kernels)")
+                    else:
+                        gr.Markdown(f"⚠️ **No Cache:** First PyTorch run ~5 min.")
             
             with gr.Accordion("ℹ️ Supported Generation Tags & Tips", open=False):
                 gr.Markdown("""
@@ -1810,20 +1810,17 @@ with gr.Blocks(title="Fish Speech S2 Pro - Voice Clone & Training GUI") as app:
                         with gr.Row():
                             delete_btn = gr.Button("Delete", size="sm", variant="stop")
                     
-                    gr.Markdown("### Transcription Settings")
-                    with gr.Row():
-                        whisper_model_size = gr.Dropdown(
-                            choices=["large-v3", "large-v2", "medium", "small", "base"], 
-                            value="large-v3", 
-                            label="Whisper Model Size",
-                            scale=1
-                        )
-                        whisper_language = gr.Dropdown(
-                            choices=list(WHISPER_LANGS.keys()),
-                            value="Auto-detect",
-                            label="Language",
-                            scale=1
-                        )
+                    gr.Markdown("### 🛰️ Transcription (Whisper)")
+                    prep_whisper_model = gr.Dropdown(
+                        choices=list(WHISPER_MODELS.keys()), 
+                        value="large-v3 (~10 GB VRAM)", 
+                        label="Whisper Model Size"
+                    )
+                    prep_whisper_language = gr.Dropdown(
+                        choices=list(WHISPER_LANGS.keys()),
+                        value="Auto-detect",
+                        label="Language"
+                    )
                     
                 with gr.Column(scale=2):
                     with gr.Tabs() as prep_tabs:
@@ -1996,9 +1993,13 @@ with gr.Blocks(title="Fish Speech S2 Pro - Voice Clone & Training GUI") as app:
                         outputs=[transcription_output, save_name_input]
                     )
 
+                    def transcribe_with_global(audio, model_disp, lang):
+                        model_internal = WHISPER_MODELS.get(model_disp, "large-v3")
+                        return transcribe_only(audio, model_internal, lang)
+
                     transcribe_btn.click(
-                        fn=transcribe_only,
-                        inputs=[prep_audio_editor, whisper_model_size, whisper_language],
+                        fn=transcribe_with_global,
+                        inputs=[prep_audio_editor, prep_whisper_model, prep_whisper_language],
                         outputs=[transcription_output]
                     )
 
@@ -2014,9 +2015,13 @@ with gr.Blocks(title="Fish Speech S2 Pro - Voice Clone & Training GUI") as app:
                         outputs=[prep_audio_editor, prep_status]
                     )
 
+                    def batch_process_with_global(folder, name, model_disp, lang, batch_size):
+                        model_internal = WHISPER_MODELS.get(model_disp, "large-v3")
+                        return handle_full_batch_process(folder, name, model_internal, lang, batch_size)
+
                     batch_process_btn.click(
-                        fn=handle_full_batch_process,
-                        inputs=[batch_folder_input, batch_dataset_name, whisper_model_size, whisper_language, faster_whisper_batch],
+                        fn=batch_process_with_global,
+                        inputs=[batch_folder_input, batch_dataset_name, prep_whisper_model, prep_whisper_language, faster_whisper_batch],
                         outputs=[batch_status]
                     )
 
@@ -2031,6 +2036,7 @@ with gr.Blocks(title="Fish Speech S2 Pro - Voice Clone & Training GUI") as app:
 
                     prep_tab_single.select(fn=show_samples_group, inputs=[], outputs=[audio_samples_group])
                     prep_tab_dataset.select(fn=hide_samples_group, inputs=[], outputs=[audio_samples_group])
+
 
         with gr.Tab("Lora Training (Experimental)", id="tab_lora_training"):
             gr.Markdown("### 🏋️ Fish Speech S2 Pro LoRA Training Pipeline")
@@ -2182,6 +2188,19 @@ with gr.Blocks(title="Fish Speech S2 Pro - Voice Clone & Training GUI") as app:
                 fn=lambda: gr.update(choices=get_existing_training_projects()),
                 outputs=[model_name_input]
             )
+
+
+    # --- Synchronize all Whisper components across tabs ---
+    all_whisper_models = [infer_whisper_model, prep_whisper_model]
+    all_whisper_langs = [infer_whisper_language, prep_whisper_language]
+
+    def sync_w_model(val): return [gr.update(value=val)] * 2
+    def sync_w_lang(val): return [gr.update(value=val)] * 2
+
+    for m in all_whisper_models:
+        m.change(sync_w_model, inputs=[m], outputs=all_whisper_models)
+    for l in all_whisper_langs:
+        l.change(sync_w_lang, inputs=[l], outputs=all_whisper_langs)
 
 if __name__ == "__main__":
     # Use "127.0.0.1" for local access or "0.0.0.0" for network access
