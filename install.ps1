@@ -2,6 +2,7 @@
 # Run with: powershell -ExecutionPolicy Bypass -File install.ps1
 
 $ErrorActionPreference = "Stop"
+Set-Location $PSScriptRoot
 
 function Write-Header($text) {
     Write-Host ""
@@ -14,19 +15,47 @@ function Write-Warn($text) { Write-Host "[WARNING] $text" -ForegroundColor Yello
 function Write-Err($text)  { Write-Host "[ERROR] $text" -ForegroundColor Red }
 function Write-Info($text) { Write-Host "[INFO] $text" -ForegroundColor Gray }
 
+function Refresh-UvPath {
+    $paths = @(
+        "$env:USERPROFILE\.local\bin",
+        "$env:USERPROFILE\.cargo\bin",
+        "$env:APPDATA\uv\bin",
+        "$env:LOCALAPPDATA\uv\bin",
+        "$env:LOCALAPPDATA\Programs\uv"
+    )
+    $env:PATH = (($paths + ($env:PATH -split ";")) | Where-Object { $_ } | Select-Object -Unique) -join ";"
+}
+
+function Ensure-Uv {
+    Refresh-UvPath
+    $uv = Get-Command uv -ErrorAction SilentlyContinue
+    if ($uv) {
+        Write-Info (& uv --version)
+        return
+    }
+
+    Write-Info "UV not found. Installing..."
+    powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://astral.sh/uv/install.ps1 | iex"
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to install uv. Please install it manually from https://astral.sh/uv/"
+    }
+
+    Refresh-UvPath
+    $uv = Get-Command uv -ErrorAction SilentlyContinue
+    if (-not $uv) {
+        throw "uv was installed but is still not visible in PATH for this session. Open a new terminal and run install.bat again."
+    }
+
+    Write-Ok "$(& uv --version) is ready."
+}
+
 Write-Header "Fish Speech S2 Pro - Voice Clone & Training - Installer"
 
 # -------------------------------------------------------
 # UV
 # -------------------------------------------------------
 Write-Header "Checking UV"
-if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
-    Write-Info "UV not found. Installing..."
-    powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
-    $env:PATH = "$env:USERPROFILE\.cargo\bin;$env:APPDATA\uv\bin;$env:PATH"
-} else {
-    Write-Ok "UV is already installed."
-}
+Ensure-Uv
 
 # -------------------------------------------------------
 # Ninja (winget)
@@ -37,6 +66,7 @@ if (-not (Get-Command ninja -ErrorAction SilentlyContinue) -and (Get-Command win
         winget install --id Ninja-build.Ninja --exact --silent --accept-source-agreements --accept-package-agreements
         # Refresh Path for current session
         $env:PATH = [System.Environment]::GetEnvironmentVariable("Path", "User") + ";" + [System.Environment]::GetEnvironmentVariable("Path", "Machine")
+        Refresh-UvPath
     } catch {
         Write-Warn "Winget failed to install Ninja. Please install it manually from https://ninja-build.org/"
     }
