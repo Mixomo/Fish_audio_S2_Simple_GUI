@@ -34,15 +34,24 @@ Write-Header "Fish Speech S2 Pro - Voice Clone & Training - Linux Installer"
 Write-Header "Checking UV"
 refresh_uv_path() {
     export PATH="$HOME/.local/bin:$HOME/.cargo/bin:${XDG_BIN_HOME:-$HOME/.local/bin}:$PATH"
-    [ -f "$HOME/.local/bin/env" ] && . "$HOME/.local/bin/env"
-    [ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
+    if [ -f "$HOME/.local/bin/env" ]; then
+        . "$HOME/.local/bin/env" || true
+    fi
+    if [ -f "$HOME/.cargo/env" ]; then
+        . "$HOME/.cargo/env" || true
+    fi
+    return 0
 }
 
 ensure_uv() {
     refresh_uv_path
     if command -v uv >/dev/null 2>&1; then
-        Write-Info "$(uv --version)"
-        return 0
+        UV_VERSION="$(uv --version 2>/dev/null || true)"
+        if [ -n "$UV_VERSION" ]; then
+            Write-Info "$UV_VERSION"
+            return 0
+        fi
+        Write-Warn "A uv command was found, but it did not run correctly. Reinstalling uv..."
     fi
 
     Write-Info "UV not found. Installing..."
@@ -63,7 +72,13 @@ ensure_uv() {
         exit 1
     fi
 
-    Write-Ok "$(uv --version) is ready."
+    UV_VERSION="$(uv --version 2>/dev/null || true)"
+    if [ -z "$UV_VERSION" ]; then
+        Write-Err "UV is visible in PATH but failed to run. Remove the broken uv entry from PATH and run install.sh again."
+        exit 1
+    fi
+
+    Write-Ok "$UV_VERSION is ready."
 }
 
 ensure_uv
