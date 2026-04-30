@@ -1,5 +1,5 @@
 @echo off
-setlocal enabledelayedexpansion
+setlocal
 cd /d "%~dp0"
 
 :: Performance Optimizations for OpenMP (Threading Affinity)
@@ -18,16 +18,12 @@ echo Checking environment...
 set "PATH=%USERPROFILE%\.local\bin;%USERPROFILE%\.cargo\bin;%APPDATA%\uv\bin;%LOCALAPPDATA%\uv\bin;%LOCALAPPDATA%\Programs\uv;%PATH%"
 
 where uv >nul 2>nul
-if %ERRORLEVEL% NEQ 0 (
-    echo [ERROR] uv not found in PATH. Run install.bat first, then reopen this terminal.
-    pause
-    exit /b 1
-)
+if errorlevel 1 goto uv_missing
 
 echo Checking for Ninja...
 
 where ninja >nul 2>nul
-if %ERRORLEVEL% NEQ 0 (
+if errorlevel 1 (
     echo [WARNING] Ninja not found in PATH. torch.compile may be slow or fail.
     echo           Run install.bat if you haven't yet, or restart your terminal.
 ) else (
@@ -35,11 +31,18 @@ if %ERRORLEVEL% NEQ 0 (
 )
 
 echo Starting application...
-if not exist ".venv\Scripts\activate.bat" (
-    echo [ERROR] Virtual environment (.venv) not found. Please run install.bat first.
-    pause
-    exit /b 1
-)
+if not exist ".venv\Scripts\activate.bat" goto venv_missing
 call .venv\Scripts\activate.bat
 uv run app.py
 pause
+exit /b 0
+
+:uv_missing
+echo [ERROR] uv not found in PATH. Run install.bat first, then reopen this terminal.
+pause
+exit /b 1
+
+:venv_missing
+echo [ERROR] Virtual environment .venv not found. Please run install.bat first.
+pause
+exit /b 1
