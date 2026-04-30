@@ -11,6 +11,7 @@ export KMP_BLOCKTIME=0
 # Usage: bash install.sh
 
 set -e
+cd "$(dirname "$0")"
 
 # --- Logging helpers ---
 Write-Header() {
@@ -31,15 +32,41 @@ Write-Header "Fish Speech S2 Pro - Voice Clone & Training - Linux Installer"
 # UV Installation
 # -------------------------------------------------------
 Write-Header "Checking UV"
-if ! command -v uv &> /dev/null; then
+refresh_uv_path() {
+    export PATH="$HOME/.local/bin:$HOME/.cargo/bin:${XDG_BIN_HOME:-$HOME/.local/bin}:$PATH"
+    [ -f "$HOME/.local/bin/env" ] && . "$HOME/.local/bin/env"
+    [ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
+}
+
+ensure_uv() {
+    refresh_uv_path
+    if command -v uv >/dev/null 2>&1; then
+        Write-Info "$(uv --version)"
+        return 0
+    fi
+
     Write-Info "UV not found. Installing..."
-    curl -LsSf https://astral.sh/uv/install.sh | sh
-    # Source for current session
-    export PATH="$HOME/.cargo/bin:$PATH"
-    if [ -f "$HOME/.local/bin/uv" ]; then export PATH="$HOME/.local/bin:$PATH"; fi
-else
-    Write-Ok "UV is already installed."
-fi
+    if ! command -v curl >/dev/null 2>&1; then
+        Write-Err "curl is required to install UV. Please install curl and run this script again."
+        exit 1
+    fi
+
+    if ! curl -LsSf https://astral.sh/uv/install.sh | sh; then
+        Write-Err "Failed to install UV. Please install it manually from https://astral.sh/uv/"
+        exit 1
+    fi
+
+    refresh_uv_path
+    if ! command -v uv >/dev/null 2>&1; then
+        Write-Err "UV was installed but is still not visible in PATH for this session."
+        Write-Err "Open a new terminal or source ~/.local/bin/env, then run install.sh again."
+        exit 1
+    fi
+
+    Write-Ok "$(uv --version) is ready."
+}
+
+ensure_uv
 
 # -------------------------------------------------------
 # System Dependencies
