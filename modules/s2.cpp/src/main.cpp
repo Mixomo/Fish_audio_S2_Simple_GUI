@@ -34,6 +34,7 @@ void print_uso() {
     safe_print("  -pt, --prompt-text <text>   Text of the reference audio\n");
     safe_print("  -o, --output       <path>   Output WAV path\n");
     safe_print("  -v, -c, --vulkan, --cuda <id>   Vulkan/Cuda device index (-1 = CPU)\n");
+    safe_print("  --codec-cuda              CUDA reference encoder + CPU waveform decoder\n");
     safe_print("  -threads           <n>      Number of threads\n");
     safe_print("  -max-tokens        <n>      Max tokens to generate\n");
     safe_print("  --min-tokens-before-end <n> Minimum tokens before EOS is allowed\n");
@@ -113,6 +114,7 @@ int main(int argc, char** argv) {
         else if (arg == "-o"  || arg == "--output")       { if (i+1 < argc) params.output_path        = argv[++i]; }
         else if (arg == "-v"  || arg == "--vulkan")       { if (i+1 < argc) { try { params.gpu_device = std::stoi(argv[++i]); } catch(...) {} params.backend_type = 0; } }
         else if (arg == "-c"  || arg == "--cuda")         { if (i+1 < argc) { try { params.gpu_device = std::stoi(argv[++i]); } catch(...) {} params.backend_type = 1; } }
+        else if (arg == "--codec-cuda")                   { params.codec_cuda = true; }
         else if (arg == "-threads")                       { if (i+1 < argc) { try { params.gen.n_threads      = std::stoi(argv[++i]); } catch(...) {} } }
         else if (arg == "-max-tokens")                    { if (i+1 < argc) { try { params.gen.max_new_tokens = std::stoi(argv[++i]); } catch(...) {} } }
         else if (arg == "--min-tokens-before-end")        {

@@ -1,8 +1,23 @@
 import gradio as gr
+import importlib.util
 import os
 import subprocess
 import time
+import warnings
 from pathlib import Path
+
+try:
+    from starlette.exceptions import StarletteDeprecationWarning
+    warnings.filterwarnings(
+        "ignore",
+        message=(
+            "'HTTP_422_UNPROCESSABLE_ENTITY' is deprecated. "
+            "Use 'HTTP_422_UNPROCESSABLE_CONTENT' instead."
+        ),
+        category=StarletteDeprecationWarning,
+    )
+except ImportError:
+    pass
 
 # --- PERSISTENT CACHE CONFIGURATION (Must be set BEFORE importing torch) ---
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -26,6 +41,75 @@ import yaml
 import winsound
 import sys
 
+# s2.cpp executable discovery
+def _configured_s2_executable():
+    """Return an optional s2.exe path from config.py without requiring it."""
+    config_path = os.path.join(ROOT_DIR, "config.py")
+    if not os.path.isfile(config_path):
+        return None
+
+    try:
+        spec = importlib.util.spec_from_file_location("_fish_s2_config", config_path)
+        config = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(config)
+    except Exception as e:
+        print(f"[WARNING] Could not load {config_path}: {e}")
+        return None
+
+    for name in (
+        "S2_EXECUTABLE",
+        "S2_EXECUTABLE_PATH",
+        "S2_EXE_PATH",
+        "S2_PATH",
+        "S2_EXEC",
+        "CPP_EXEC",
+    ):
+        value = getattr(config, name, None)
+        if value:
+            return os.fspath(value)
+    return None
+
+
+def get_s2_executable_candidates():
+    """Return absolute s2.exe candidates in lookup priority order."""
+    candidates = []
+    configured_path = _configured_s2_executable()
+    if configured_path:
+        configured_path = os.path.expandvars(os.path.expanduser(configured_path))
+        if not os.path.isabs(configured_path):
+            configured_path = os.path.join(ROOT_DIR, configured_path)
+        candidates.append(configured_path)
+
+    s2_root = os.path.join(ROOT_DIR, "modules", "s2.cpp")
+    candidates.extend([
+        os.path.join(s2_root, "build", "bin", "Release", "s2.exe"),
+        os.path.join(s2_root, "build", "Release", "s2.exe"),
+        os.path.join(s2_root, "build", "bin", "s2.exe"),
+        os.path.join(s2_root, "build", "s2.exe"),
+        os.path.join(s2_root, "s2.exe"),
+    ])
+
+    # Keep the error list readable if config.py duplicates a standard path.
+    return list(dict.fromkeys(os.path.abspath(path) for path in candidates))
+
+
+def find_s2_executable():
+    """Return (executable, checked_paths), where executable may be None."""
+    checked_paths = get_s2_executable_candidates()
+    executable = next((path for path in checked_paths if os.path.isfile(path)), None)
+    return executable, checked_paths
+
+
+def format_s2_not_found_error(checked_paths):
+    checked = "\n".join(f"  - {path}" for path in checked_paths)
+    return (
+        "s2.exe was not found, so the C++ synthesis engine cannot start.\n\n"
+        f"Locations checked:\n{checked}\n\n"
+        "Install Visual Studio 2022 with the 'Desktop development with C++' "
+        "workload, then rerun install.bat to build s2.cpp."
+    )
+
+
 # Audio Chime Path
 CHIME_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "inference_training_done.wav")
 
@@ -40,9 +124,6 @@ def play_done_chime():
         winsound.MessageBeep()
 
 # Main Paths
-CPP_EXEC = os.path.join(ROOT_DIR, "modules", "s2.cpp", "build", "Release", "s2.exe")
-if not os.path.exists(CPP_EXEC):
-    CPP_EXEC = os.path.join(ROOT_DIR, "modules", "s2.cpp", "build", "s2.exe")
 TOKENIZER_PATH = os.path.join(ROOT_DIR, "modules", "s2.cpp", "tokenizer.json")
 
 # Performance Optimizations for OpenMP (Threading Affinity)
@@ -53,6 +134,7 @@ os.environ["KMP_BLOCKTIME"] = "0"
 
 s2_process = None
 s2_current_model = None
+s2_current_codec_cuda = False
 training_process = None
 
 # CPP server stdout drain thread & queue (module-level to avoid recreation/leak)
@@ -74,8 +156,9 @@ TRAINED_MODELS_DIR = os.path.join(MODELS_DIR, "trained_models")
 WHISPER_MODELS_DIR = os.path.join(MODELS_DIR, "whisper")
 OUTPUTS_DIR = os.path.join(ROOT_DIR, "outputs")
 SAMPLES_DIR = os.path.join(ROOT_DIR, "samples")
+SAMPLE_PREVIEW_DIR = os.path.join(COMPILE_CACHE_DIR, "sample_previews")
 
-for d in [OUTPUTS_DIR, MODELS_DIR, FISH_MODELS_DIR, S2_CPP_MODELS_DIR, SAMPLES_DIR, TRAINED_MODELS_DIR, WHISPER_MODELS_DIR, COMPILE_CACHE_DIR]:
+for d in [OUTPUTS_DIR, MODELS_DIR, FISH_MODELS_DIR, S2_CPP_MODELS_DIR, SAMPLES_DIR, TRAINED_MODELS_DIR, WHISPER_MODELS_DIR, COMPILE_CACHE_DIR, SAMPLE_PREVIEW_DIR]:
     os.makedirs(d, exist_ok=True)
 
 # --- Startup: Cache Status Report ---
@@ -153,6 +236,72 @@ def get_sample_choices():
     files = [f for f in os.listdir(SAMPLES_DIR) if f.endswith(".wav")]
     return sorted([f.replace(".wav", "") for f in files])
 
+def get_sample_preview_path(audio_path):
+    """Create a browser-friendly dual-mono preview without modifying the source."""
+    if not audio_path or not os.path.isfile(audio_path):
+        return audio_path
+
+    source_stat = os.stat(audio_path)
+    source_key = f"{source_stat.st_mtime_ns}_{source_stat.st_size}"
+    sample_stem = os.path.splitext(os.path.basename(audio_path))[0]
+    preview_path = os.path.join(SAMPLE_PREVIEW_DIR, f"{sample_stem}_{source_key}.wav")
+    if os.path.isfile(preview_path):
+        return preview_path
+
+    try:
+        audio, sample_rate = sf.read(audio_path, always_2d=True, dtype="float32")
+        mono = audio[:, 0] if audio.shape[1] == 1 else np.mean(audio, axis=1)
+        pcm16 = np.clip(mono * 32767.0, -32768, 32767).astype(np.int16)
+        sf.write(
+            preview_path,
+            np.column_stack((pcm16, pcm16)),
+            sample_rate,
+            subtype="PCM_16",
+        )
+
+        prefix = f"{sample_stem}_"
+        for cached_name in os.listdir(SAMPLE_PREVIEW_DIR):
+            cached_path = os.path.join(SAMPLE_PREVIEW_DIR, cached_name)
+            if cached_name.startswith(prefix) and cached_path != preview_path:
+                try:
+                    os.remove(cached_path)
+                except OSError:
+                    pass
+        return preview_path
+    except Exception as exc:
+        print(f"[Sample Preview] Could not create dual-mono preview for {audio_path}: {exc}")
+        return audio_path
+
+
+def unload_python_engine(reset_compiler=True):
+    """Release PyTorch model, codec, compiled wrappers, and CUDA allocations."""
+    global fish_python_model, fish_python_codec
+    global fish_python_decode_one_token, fish_python_checkpoint_dir
+
+    fish_python_model = None
+    fish_python_codec = None
+    fish_python_decode_one_token = None
+    fish_python_checkpoint_dir = None
+
+    if reset_compiler:
+        try:
+            torch.compiler.reset()
+        except (AttributeError, RuntimeError):
+            try:
+                torch._dynamo.reset()
+            except (AttributeError, RuntimeError):
+                pass
+
+    import gc
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        try:
+            torch.cuda.ipc_collect()
+        except RuntimeError:
+            pass
+
+
 def get_dataset_choices():
     if not os.path.exists(TRAINING_DATA_DIR): return ["(No datasets)"]
     subdirs = [d for d in os.listdir(TRAINING_DATA_DIR) if os.path.isdir(os.path.join(TRAINING_DATA_DIR, d))]
@@ -209,7 +358,7 @@ def load_sample(sample_name):
             except: pass
             
     if os.path.exists(audio_path):
-        return audio_path, text
+        return get_sample_preview_path(audio_path), text
     return None, text
 
 # --- Helper functions ---
@@ -223,12 +372,7 @@ def generate_fish_python(text, ref_audio, ref_text, top_p, top_k, temp, rep_pen,
     if fish_python_model is None or fish_python_checkpoint_dir != target_dir:
         import gc
         if fish_python_model is not None:
-            del fish_python_model
-            del fish_python_codec
-            fish_python_model = None
-            fish_python_codec = None
-            gc.collect()
-            torch.cuda.empty_cache()
+            unload_python_engine()
             
         progress(0.1, desc=f"Loading PyTorch Model: {model_select}...")
         
@@ -311,6 +455,8 @@ def generate_fish_python(text, ref_audio, ref_text, top_p, top_k, temp, rep_pen,
             }
         
         fish_python_codec.load_state_dict(state_dict, strict=False)
+        del state_dict
+        gc.collect()
         fish_python_codec.eval()
         fish_python_codec.to(device=device, dtype=precision)
     else:
@@ -447,8 +593,17 @@ def process_audio_array(audio_data):
         
     return audio_data
 
-def clone_voice(engine, cpp_model_str, trained_model_select, text, ref_audio, ref_text, top_p, top_k, temp, rep_pen, split_by_paragraph, progress=gr.Progress()):
-    global s2_process, s2_current_model
+
+def write_synthesized_audio(path, audio_data, sample_rate):
+    """Write PCM16 dual-mono so browser players reproduce the signal centered."""
+    mono = process_audio_array(np.asarray(audio_data))
+    pcm16 = np.clip(mono * 32767.0, -32768, 32767).astype(np.int16)
+    dual_mono = np.column_stack((pcm16, pcm16))
+    sf.write(path, dual_mono, sample_rate, subtype="PCM_16")
+
+
+def clone_voice(engine, cpp_model_str, codec_cuda, trained_model_select, text, ref_audio, ref_text, top_p, top_k, temp, rep_pen, split_by_paragraph, progress=gr.Progress()):
+    global s2_process, s2_current_model, s2_current_codec_cuda
 
     if not text:
         return None, "Please enter some text to synthesize."
@@ -462,18 +617,14 @@ def clone_voice(engine, cpp_model_str, trained_model_select, text, ref_audio, re
     expected_new_tokens = int(len(text) * 4.5)
     
     if engine == ENGINE_CPP:
+        cpp_exec, checked_paths = find_s2_executable()
+        if not cpp_exec:
+            return None, format_s2_not_found_error(checked_paths)
+
         # Auto-Unload PyTorch if switching to CPP
-        global fish_python_model, fish_python_codec
         if fish_python_model is not None:
             print("Auto-Unloading PyTorch Model to free VRAM for CPP...")
-            del fish_python_model
-            del fish_python_codec
-            fish_python_model = None
-            fish_python_codec = None
-            import gc
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            unload_python_engine()
 
         from huggingface_hub import hf_hub_download
         
@@ -494,7 +645,11 @@ def clone_voice(engine, cpp_model_str, trained_model_select, text, ref_audio, re
             return None, f"Failed to download GGUF model: {e}"
         
         # Start server if not running with the same model
-        if s2_process is None or s2_current_model != filename:
+        if (
+            s2_process is None or
+            s2_current_model != filename or
+            s2_current_codec_cuda != codec_cuda
+        ):
             if s2_process is not None:
                 s2_process.kill()
                 s2_process.wait()  # Block until dead
@@ -509,9 +664,11 @@ def clone_voice(engine, cpp_model_str, trained_model_select, text, ref_audio, re
                 threads = psutil.cpu_count(logical=False) or (os.cpu_count() // 2) or 4
             except:
                 threads = (os.cpu_count() // 2) if (os.cpu_count() and os.cpu_count() > 8) else (os.cpu_count() or 4)
+            threads = max(1, int(os.environ.get("S2_THREADS", threads)))
+            print(f"[s2.cpp] Using {threads} CPU worker threads (override with S2_THREADS).")
 
             cmd = [
-                CPP_EXEC,
+                cpp_exec,
                 "-m", model_path,
                 "-t", TOKENIZER_PATH,
                 "--server",
@@ -522,13 +679,15 @@ def clone_voice(engine, cpp_model_str, trained_model_select, text, ref_audio, re
                     cmd.extend(["-c", "0"])  # CUDA for F16/Q8_0
                 else:
                     cmd.extend(["-v", "0"])  # Vulkan for k-quants
+            if codec_cuda:
+                cmd.append("--codec-cuda")
 
             # Fix PATH correctly for s2.exe to find cublas64_##.dll
             env = os.environ.copy()
             path_key = "PATH" if "PATH" in env else ("Path" if "Path" in env else "PATH")
             
             # 1. Start with mandatory app paths
-            s2_dir_path = os.path.dirname(CPP_EXEC)
+            s2_dir_path = os.path.dirname(cpp_exec)
             s2_bin_path = os.path.join(s2_dir_path, "bin")
             extra_paths = [s2_dir_path, s2_bin_path]
             
@@ -558,16 +717,26 @@ def clone_voice(engine, cpp_model_str, trained_model_select, text, ref_audio, re
                 startupinfo = subprocess.STARTUPINFO()
                 startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
                 
-            s2_process = subprocess.Popen(
-                cmd,
-                env=env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-                startupinfo=startupinfo
-            )
+            try:
+                s2_process = subprocess.Popen(
+                    cmd,
+                    env=env,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1,
+                    startupinfo=startupinfo
+                )
+            except OSError as e:
+                s2_process = None
+                s2_current_model = None
+                s2_current_codec_cuda = False
+                return None, (
+                    f"Failed to start s2.exe:\n{cpp_exec}\n\n"
+                    f"Windows reported: {e}"
+                )
             s2_current_model = filename
+            s2_current_codec_cuda = codec_cuda
             
             # Wait for server ready.
             # Re-use module-level log_queue & drain_thread to avoid re-creating
@@ -615,6 +784,7 @@ def clone_voice(engine, cpp_model_str, trained_model_select, text, ref_audio, re
                     last_msg = "\n".join(captured_logs[-5:]) if captured_logs else "No logs captured."
                     s2_process = None
                     s2_current_model = None
+                    s2_current_codec_cuda = False
                     return None, f"Fish CPP Engine crashed during startup.\n\nErrors:\n{last_msg}"
 
                 # Health-check the HTTP endpoint
@@ -685,16 +855,10 @@ def clone_voice(engine, cpp_model_str, trained_model_select, text, ref_audio, re
             if all_audio_segments:
                 combined_audio = np.concatenate(all_audio_segments)
                 
-                # Convert to mono and normalize
-                combined_audio = process_audio_array(combined_audio)
-                
-                # Convert to int16 for Gradio consistency
-                audio_int16 = (combined_audio * 32767).astype(np.int16)
-                import soundfile as sf
-                sf.write(out_wav, audio_int16, final_sr)
+                write_synthesized_audio(out_wav, combined_audio, final_sr)
                 
                 import gc
-                del all_audio_segments, combined_audio, audio_int16
+                del all_audio_segments, combined_audio
                 gc.collect()
                 
                 play_done_chime()
@@ -722,15 +886,10 @@ def clone_voice(engine, cpp_model_str, trained_model_select, text, ref_audio, re
                 import soundfile as sf
                 audio_data, sr = sf.read(io.BytesIO(res.content))
                 
-                # Convert to mono and normalize
-                audio_data = process_audio_array(audio_data)
-                
-                # Apply fix for Gradio: convert to int16
-                audio_int16 = (audio_data * 32767).astype(np.int16)
-                sf.write(out_wav, audio_int16, sr)
+                write_synthesized_audio(out_wav, audio_data, sr)
                 # Explicit GC after each generation to prevent RAM growth
                 import gc
-                del audio_data, audio_int16
+                del audio_data
                 gc.collect()
                 play_done_chime()
                 progress(1.0, desc="Done!")
@@ -765,6 +924,7 @@ def clone_voice(engine, cpp_model_str, trained_model_select, text, ref_audio, re
             s2_process.kill()
             s2_process = None
             s2_current_model = None
+            s2_current_codec_cuda = False
             import gc
             gc.collect()
             if torch.cuda.is_available():
@@ -783,11 +943,8 @@ def clone_voice(engine, cpp_model_str, trained_model_select, text, ref_audio, re
             
             # Convert to float32 to process, then back
             audio_data = audio_int16.astype(np.float32) / 32767.0
-            audio_data = process_audio_array(audio_data)
-            audio_int16 = (audio_data * 32767).astype(np.int16)
-            
             progress(0.9, desc="Saving audio...")
-            sf.write(out_wav, audio_int16, sr)
+            write_synthesized_audio(out_wav, audio_data, sr)
             play_done_chime()
             
             # Clean VRAM after logic
@@ -803,7 +960,7 @@ def clone_voice(engine, cpp_model_str, trained_model_select, text, ref_audio, re
 
     return None, "Engine not supported."
 
-def generate_dialogue(engine, cpp_model_str, trained_model_select, top_p, top_k, temp, rep_pen, split_para, row_count, silence_duration, *args, progress=gr.Progress()):
+def generate_dialogue(engine, cpp_model_str, codec_cuda, trained_model_select, top_p, top_k, temp, rep_pen, split_para, row_count, silence_duration, *args, progress=gr.Progress()):
     # args is [sample1, ..., sample20, text1, ..., text20]
     num_max = 20 # Should match MAX_DIALOGUE_SEGMENTS
     samples = args[:num_max]
@@ -833,7 +990,7 @@ def generate_dialogue(engine, cpp_model_str, trained_model_select, top_p, top_k,
             
         # Generate
         wav_path, status = clone_voice(
-            engine, cpp_model_str, trained_model_select, text, ref_audio, ref_text, 
+            engine, cpp_model_str, codec_cuda, trained_model_select, text, ref_audio, ref_text,
             top_p, top_k, temp, rep_pen, split_para, progress=progress
         )
         
@@ -862,9 +1019,7 @@ def generate_dialogue(engine, cpp_model_str, trained_model_select, top_p, top_k,
             
         # Output file
         out_wav = os.path.join(OUTPUTS_DIR, f"dialogue_{int(time.time()*1000)}.wav")
-        # Gradio fix: int16
-        audio_int16 = (combined * 32767).astype(np.int16)
-        sf.write(out_wav, audio_int16, final_sr)
+        write_synthesized_audio(out_wav, combined, final_sr)
         return out_wav, f"Dialogue generated successfully with {len(segments)} segments!"
     
     return None, "No audio generated."
@@ -1568,11 +1723,8 @@ with gr.Blocks(title="Fish Speech S2 Pro - Voice Clone & Training GUI") as app:
             unload_status = gr.Markdown(" ", visible=True)
             
             def clear_vram():
-                import gc
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                return "VRAM freed."
+                unload_python_engine()
+                return "PyTorch model, compiler state, RAM and VRAM caches released."
             def clear_vram_msg():
                 time.sleep(2)
                 return " "
@@ -1633,9 +1785,17 @@ with gr.Blocks(title="Fish Speech S2 Pro - Voice Clone & Training GUI") as app:
             def update_engine_ui(engine):
                 is_cpp = (engine == ENGINE_CPP)
                 if is_cpp:
-                    return gr.update(visible=True), gr.update(visible=False)
+                    return (
+                        gr.update(visible=True),
+                        gr.update(visible=False),
+                        gr.update(),
+                    )
                 else:
-                    return gr.update(visible=False), gr.update(visible=True)
+                    return (
+                        gr.update(visible=False),
+                        gr.update(visible=True),
+                        gr.update(value=False),
+                    )
 
             def update_split_count(text):
                 if not text: return "### ✂️ Splits\n**0** Clips"
@@ -1652,14 +1812,21 @@ with gr.Blocks(title="Fish Speech S2 Pro - Voice Clone & Training GUI") as app:
                         value=ENGINE_CPP,
                         label="Inference Engine"
                     )
-                    with gr.Row():
-                        cpp_model_row = gr.Row(visible=True)
-                        with cpp_model_row:
+                    cpp_model_row = gr.Column(visible=True)
+                    with cpp_model_row:
+                        with gr.Row():
                             cpp_model_dropdown = gr.Dropdown(
                                 choices=list(GGUF_MODELS.keys()), 
                                 label="GGUF Model", 
                                 value=list(GGUF_MODELS.keys())[1]
                             )
+                        with gr.Row():
+                            codec_cuda_check = gr.Checkbox(
+                                label="CUDA Reference Encoder (Experimental)",
+                                value=False,
+                                info="Accelerates sample encoding on CUDA while keeping waveform decoding on the faster CPU path. Uses additional VRAM."
+                            )
+                    with gr.Row():
                         trained_model_row = gr.Row(visible=False)
                         with trained_model_row:
                             trained_model_dropdown = gr.Dropdown(
@@ -1685,7 +1852,14 @@ with gr.Blocks(title="Fish Speech S2 Pro - Voice Clone & Training GUI") as app:
                             split_para_check = gr.Checkbox(label="Split by Paragraphs (Recommended for long texts)", value=False)
                             gr.Markdown("ℹ️ *To apply splits, you must press **Enter** after each sentence or point where you want a cut; each line break will generate an independent audio clip that will be automatically merged.*")
                         with gr.Column():
-                            dialogue_silence_slider = gr.Slider(0, 5, value=0.5, step=0.1, label="Silence between speakers (s)")
+                            with gr.Column(visible=False) as dialogue_silence_column:
+                                dialogue_silence_slider = gr.Slider(
+                                    0,
+                                    5,
+                                    value=0.5,
+                                    step=0.1,
+                                    label="Silence between speakers (s)",
+                                )
 
                 with gr.Column(scale=1):
                     gr.Markdown("### 🛰️ Transcription (Whisper)")
@@ -1902,7 +2076,9 @@ with gr.Blocks(title="Fish Speech S2 Pro - Voice Clone & Training GUI") as app:
                     engine_dropdown.change(
                         fn=update_engine_ui,
                         inputs=engine_dropdown,
-                        outputs=[cpp_model_row, trained_model_row]
+                        outputs=[cpp_model_row, trained_model_row, codec_cuda_check],
+                        queue=False,
+                        show_progress="hidden",
                     )
 
                     target_text.change(
@@ -1912,14 +2088,16 @@ with gr.Blocks(title="Fish Speech S2 Pro - Voice Clone & Training GUI") as app:
                     )
 
                     split_para_check.change(
-                        fn=lambda x: gr.update(visible=x),
+                        fn=lambda x: (gr.update(visible=x), gr.update(visible=x)),
                         inputs=[split_para_check],
-                        outputs=[split_counter_display]
+                        outputs=[split_counter_display, dialogue_silence_column],
+                        queue=False,
+                        show_progress="hidden",
                     )
 
                     generate_btn.click(
                         fn=clone_voice,
-                        inputs=[engine_dropdown, cpp_model_dropdown, trained_model_dropdown, target_text, vc_sample_audio, vc_sample_text, top_p_slider, top_k_slider, temperature_slider, rep_pen_slider, split_para_check],
+                        inputs=[engine_dropdown, cpp_model_dropdown, codec_cuda_check, trained_model_dropdown, target_text, vc_sample_audio, vc_sample_text, top_p_slider, top_k_slider, temperature_slider, rep_pen_slider, split_para_check],
                         outputs=[output_audio, clone_status]
                     )
 
@@ -1948,7 +2126,7 @@ with gr.Blocks(title="Fish Speech S2 Pro - Voice Clone & Training GUI") as app:
                     generate_dialogue_btn.click(
                         fn=generate_dialogue,
                         inputs=[
-                            engine_dropdown, cpp_model_dropdown, trained_model_dropdown, 
+                            engine_dropdown, cpp_model_dropdown, codec_cuda_check, trained_model_dropdown,
                             top_p_slider, top_k_slider, temperature_slider, rep_pen_slider, split_para_check,
                             dialogue_row_count, dialogue_silence_slider,
                             *all_samples_ui,

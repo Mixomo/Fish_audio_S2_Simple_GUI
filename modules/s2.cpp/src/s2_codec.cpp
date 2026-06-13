@@ -564,6 +564,9 @@ static void project_1x1(const std::vector<float> & input, int32_t frames,
                          const std::vector<float> & weight, const std::vector<float> & bias,
                          std::vector<float> & output) {
     output.assign(static_cast<size_t>(frames) * out_dim, 0.0f);
+    #ifdef _OPENMP
+    #pragma omp parallel for
+    #endif
     for (int32_t t = 0; t < frames; ++t) {
         const float * src = input.data() + static_cast<size_t>(t) * in_dim;
         float * dst = output.data() + static_cast<size_t>(t) * out_dim;
@@ -697,6 +700,7 @@ bool AudioCodec::load(const std::string & gguf_path, int32_t gpu_device, int32_t
     }
     if (!impl_->backend) impl_->backend = ggml_backend_cpu_init();
     if (!impl_->backend) { std::cerr << "[Codec] No backend." << std::endl; return false; }
+    std::cout << "[Codec] Backend: " << ggml_backend_name(impl_->backend) << std::endl;
 
     struct gguf_init_params params = { true, &impl_->ctx_w };
     gguf_context * gguf_ctx = gguf_init_from_file(gguf_path.c_str(), params);
@@ -851,6 +855,10 @@ bool AudioCodec::load(const std::string & gguf_path, int32_t gpu_device, int32_t
 
 bool AudioCodec::encode(const float * audio, int32_t n_samples, int32_t n_threads,
                          std::vector<int32_t> & codes_out, int32_t & n_frames_out) {
+#ifdef _OPENMP
+    omp_set_num_threads(std::max(1, n_threads));
+#endif
+
     // Pad audio to multiple of frame_length
     const int32_t frame_length = (impl_->frame_length > 0) ? impl_->frame_length : 512;
     const int32_t padded = ((n_samples + frame_length - 1) / frame_length) * frame_length;
@@ -1039,6 +1047,10 @@ bool AudioCodec::encode(const float * audio, int32_t n_samples, int32_t n_thread
 bool AudioCodec::decode(const int32_t * codes, int32_t n_frames, int32_t n_threads,
                          std::vector<float> & audio_out) {
     if (n_frames <= 0) return false;
+
+#ifdef _OPENMP
+    omp_set_num_threads(std::max(1, n_threads));
+#endif
 
     // Step 1: dequantize VQ codes to stage vector (n_frames, quantizer_input_dim)
     std::vector<float> stage;

@@ -35,9 +35,19 @@ We have successfully achieved **Linux-level inference speeds on Windows** throug
 *   **GGUF Quantization Support**: Native support for **F16, Q8_0, Q6_K, Q5_K_M, Q4_K_M, Q3_K, and Q2_K** models.
 *   **Automated GPU Orchestration**: 
     *   **CUDA Core Engine**: Used for high-precision models (F16, Q8_0) on supported NVIDIA GPUs.
+    *   **Optional CUDA Reference Encoder**: The C++ controls can encode voice samples on CUDA while retaining CPU waveform decoding, which is faster for this causal codec. It is experimental and disabled by default.
     *   **Vulkan Engine**: Leveraged for K-quantized models (`Q_K` types) to ensure stability and compatibility.
     *   **CPU Fallback**: Automatic fallback for lower quantization levels or systems without dedicated GPUs.
 *   **Intelligent Text Processing**: Features automatic paragraph splitting for long texts to ensure smooth and high-quality synthesis.
+
+### NVIDIA GPU Compatibility
+
+*   **GTX 16xx (Turing, compute capability 7.5)**: Supported by current CUDA toolkits. Prefer quantized models on cards with 4-6 GB VRAM.
+*   **GTX 10xx (Pascal, compute capability 6.1)**: Supported by the C++ engine when built with **CUDA Toolkit 12.4-12.9**. CUDA 13 cannot target Pascal.
+*   **Low-VRAM cards**: Prefer Q6_K/Q5_K/Q4_K models through Vulkan, or Q3_K/Q2_K through CPU fallback. F16 and Q8_0 require substantially more VRAM.
+*   **Installer behavior**: `install.bat` selects an installed CUDA 12.x toolkit for Pascal even if CUDA 13 is also installed. If no compatible toolkit exists, it automatically downloads NVIDIA's signed CUDA 12.9.1 network installer, waits for its silent installation, and verifies `nvcc` before building.
+
+The quantized C++ engine is the recommended path for older GPUs. The PyTorch engine has higher VRAM requirements and compatibility also depends on the architectures included in the installed PyTorch wheel.
 
 ### 🛠️ Advanced Dataset Preparation
 *   **Single Editor**: Drag-and-drop interface for individual audio editing. Trim, normalize, and transcribe audio on the fly.

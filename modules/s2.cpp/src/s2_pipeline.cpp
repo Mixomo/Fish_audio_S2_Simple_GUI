@@ -1,4 +1,5 @@
 #include "../include/s2_pipeline.h"
+#include <chrono>
 #include <cstdio>
 #include <cmath>
 
@@ -33,6 +34,14 @@ bool Pipeline::init(const PipelineParams & params) {
     if (!codec_.load(params.model_path, -1, -1)) {
         safe_print_error_ln("Pipeline error: could not load codec from " + params.model_path);
         return false;
+    }
+    if (params.codec_cuda) {
+        codec_cuda_encoder_ = std::make_unique<AudioCodec>();
+        if (!codec_cuda_encoder_->load(params.model_path, 0, 1)) {
+            safe_print_error_ln("Pipeline error: could not load CUDA reference encoder.");
+            return false;
+        }
+        safe_print_ln("[Codec] Hybrid mode: CUDA reference encoder + CPU waveform decoder");
     }
 
     {
@@ -134,6 +143,10 @@ bool Pipeline::synthesize_to_memory(const PipelineParams & params, void** ref_au
 
 bool Pipeline::synthesize_raw(const PipelineParams & params, AudioData & ref_audio, std::vector<float>& audio_out) {
     std::lock_guard<std::mutex> lock(synthesize_mutex_);
+    using clock = std::chrono::steady_clock;
+    const auto elapsed_seconds = [](clock::time_point start) {
+        return std::chrono::duration<double>(clock::now() - start).count();
+    };
 
     if (!initialized_) {
         safe_print_error_ln("Pipeline not initialized.");
@@ -151,12 +164,15 @@ bool Pipeline::synthesize_raw(const PipelineParams & params, AudioData & ref_aud
     int32_t T_prompt = 0;
 
     if (!ref_audio.samples.empty()) {
-        if (!codec_.encode(ref_audio.samples.data(), (int32_t)ref_audio.samples.size(),
-                           params.gen.n_threads, ref_codes, T_prompt)) {
+        const auto encode_start = clock::now();
+        AudioCodec & encoder = codec_cuda_encoder_ ? *codec_cuda_encoder_ : codec_;
+        if (!encoder.encode(ref_audio.samples.data(), (int32_t)ref_audio.samples.size(),
+                            params.gen.n_threads, ref_codes, T_prompt)) {
             safe_print_error_ln("Pipeline warning: encode failed, running without reference audio.");
             ref_codes.clear();
             T_prompt = 0;
         }
+        safe_print_ln("[Timing] Reference encode: " + std::to_string(elapsed_seconds(encode_start)) + " s");
     }
 
     PromptTensor prompt = build_prompt(
@@ -170,17 +186,21 @@ bool Pipeline::synthesize_raw(const PipelineParams & params, AudioData & ref_aud
         return false;
     }
 
+    const auto generate_start = clock::now();
     GenerateResult res = generate(model_, tokenizer_.config(), prompt, params.gen);
+    safe_print_ln("[Timing] AR generation: " + std::to_string(elapsed_seconds(generate_start)) + " s");
 
     if (res.n_frames == 0) {
         safe_print_error_ln("Pipeline error: generation produced no frames.");
         return false;
     }
 
+    const auto decode_start = clock::now();
     if (!codec_.decode(res.codes.data(), res.n_frames, params.gen.n_threads, audio_out)) {
         safe_print_error_ln("Pipeline error: decode failed.");
         return false;
     }
+    safe_print_ln("[Timing] Waveform decode: " + std::to_string(elapsed_seconds(decode_start)) + " s");
 
     model_.clear_kv_cache();
     return true;

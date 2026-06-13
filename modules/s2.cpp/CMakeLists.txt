@@ -9,6 +9,17 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
+# Prefer the optimized native CPU kernels and OpenMP for CPU-only execution
+# and for the small host-side VQ stages that remain when using a GPU backend.
+set(GGML_NATIVE ON CACHE BOOL "Optimize ggml for the build machine" FORCE)
+set(GGML_OPENMP ON CACHE BOOL "Enable ggml OpenMP support" FORCE)
+set(GGML_CPU_REPACK ON CACHE BOOL "Enable optimized quantized CPU repacking" FORCE)
+set(GGML_LTO ON CACHE BOOL "Enable ggml link-time optimization" FORCE)
+
+if(MSVC)
+    add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/EHsc>)
+endif()
+
 # ---------------------------------------------------------------------------
 # Options
 # ---------------------------------------------------------------------------

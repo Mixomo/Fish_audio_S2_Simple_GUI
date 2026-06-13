@@ -404,8 +404,16 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
     char * src1_ddc = (char *) src1->data;
 
     const bool contiguous_srcs = ggml_is_contiguous(src0) && ggml_is_contiguous(src1);
-    const bool can_be_transposed = nb01 == (int64_t)ggml_element_size(src0) &&
-        src0->ne[3] == 1 && nb02 == ne00 * ne01 * (int64_t)ggml_element_size(src0);
+    const int64_t transpose_grid_y =
+        (ne00 + CUDA_CPY_TILE_DIM_2D - 1) / CUDA_CPY_TILE_DIM_2D;
+    const int64_t transpose_grid_z =
+        (ne / (ne01 * ne00) + CUDA_CPY_BLOCK_NM - 1) / CUDA_CPY_BLOCK_NM;
+    const bool can_be_transposed =
+        nb01 == (int64_t)ggml_element_size(src0) &&
+        src0->ne[3] == 1 &&
+        nb02 == ne00 * ne01 * (int64_t)ggml_element_size(src0) &&
+        transpose_grid_y < USHRT_MAX &&
+        transpose_grid_z < USHRT_MAX;
 
     if (src0->type == src1->type && contiguous_srcs) {
         GGML_ASSERT(ggml_nbytes(src0) == ggml_nbytes(src1));

@@ -15,6 +15,197 @@ function Write-Warn($text) { Write-Host "[WARNING] $text" -ForegroundColor Yello
 function Write-Err($text)  { Write-Host "[ERROR] $text" -ForegroundColor Red }
 function Write-Info($text) { Write-Host "[INFO] $text" -ForegroundColor Gray }
 
+function Get-VsWherePath {
+    $candidates = @(
+        "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe",
+        "$env:ProgramFiles\Microsoft Visual Studio\Installer\vswhere.exe"
+    )
+    return $candidates | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
+}
+
+function Test-MsvcToolchain($vcvars) {
+    if (-not $vcvars -or -not (Test-Path $vcvars)) {
+        return $false
+    }
+
+    cmd /d /s /c "call `"$vcvars`" >nul 2>&1 && where cl.exe >nul 2>&1"
+    return ($LASTEXITCODE -eq 0)
+}
+
+function Find-MsvcToolchain {
+    $vswhere = Get-VsWherePath
+    if ($vswhere) {
+        $installPath = & $vswhere -latest -products * -version "[17.0,18.0)" `
+            -requires Microsoft.VisualStudio.Workload.NativeDesktop Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -property installationPath
+        if ($installPath) {
+            $vcvars = Join-Path ($installPath | Select-Object -First 1) "VC\Auxiliary\Build\vcvars64.bat"
+            if (Test-MsvcToolchain $vcvars) {
+                return $vcvars
+            }
+        }
+    }
+
+    $vsBase = "C:\Program Files\Microsoft Visual Studio\2022"
+    foreach ($edition in @("Community", "Professional", "Enterprise", "BuildTools")) {
+        $vcvars = Join-Path $vsBase "$edition\VC\Auxiliary\Build\vcvars64.bat"
+        if (Test-MsvcToolchain $vcvars) {
+            return $vcvars
+        }
+    }
+    return $null
+}
+
+function Get-S2Executable {
+    $s2Root = Join-Path $PSScriptRoot "modules\s2.cpp"
+    $candidates = @(
+        (Join-Path $s2Root "build\bin\Release\s2.exe"),
+        (Join-Path $s2Root "build\Release\s2.exe"),
+        (Join-Path $s2Root "build\bin\s2.exe"),
+        (Join-Path $s2Root "build\s2.exe"),
+        (Join-Path $s2Root "s2.exe")
+    )
+    return $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+}
+
+function Test-S2BuildNeeded($s2Executable) {
+    if (-not $s2Executable -or -not (Test-Path $s2Executable)) {
+        return $true
+    }
+
+    $sourceRoot = Join-Path $PSScriptRoot "modules\s2.cpp"
+    $latestSource = Get-ChildItem $sourceRoot -Recurse -File |
+        Where-Object {
+            $_.FullName -notlike "$sourceRoot\build\*" -and
+            ($_.Extension -in @(".c", ".cpp", ".cu", ".h", ".hpp") -or $_.Name -eq "CMakeLists.txt")
+        } |
+        Sort-Object LastWriteTimeUtc -Descending |
+        Select-Object -First 1
+
+    return ($latestSource -and $latestSource.LastWriteTimeUtc -gt (Get-Item $s2Executable).LastWriteTimeUtc)
+}
+
+function Stop-MissingMsvc {
+    Write-Err "Visual Studio 2022 with the C++ toolchain was not detected."
+    Write-Host "Install Visual Studio 2022 Community from:"
+    Write-Host "  https://aka.ms/vs/17/release/vs_community.exe"
+    Write-Host "Select the workload:"
+    Write-Host "  Desktop development with C++"
+    Write-Host "Then rerun install.bat."
+    throw "Required Visual Studio 2022 C++ toolchain is unavailable."
+}
+
+function Refresh-SystemPath {
+    $userPath = [System.Environment]::GetEnvironmentVariable("Path", "User")
+    $machinePath = [System.Environment]::GetEnvironmentVariable("Path", "Machine")
+    $env:PATH = (($userPath, $machinePath, $env:PATH) | Where-Object { $_ }) -join ";"
+}
+
+function Install-Cuda129ForLegacyGpu {
+    $cudaVersion = "12.9.1"
+    $installerName = "cuda_${cudaVersion}_windows_network.exe"
+    $installerUrl = "https://developer.download.nvidia.com/compute/cuda/$cudaVersion/network_installers/$installerName"
+    $installerPath = Join-Path $env:TEMP $installerName
+
+    Write-Header "Installing CUDA Toolkit $cudaVersion for Pascal/Volta"
+    Write-Info "Downloading the official NVIDIA network installer..."
+    Write-Info "The toolkit installation is several gigabytes and can take a while."
+
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        Invoke-WebRequest -Uri $installerUrl -OutFile $installerPath -UseBasicParsing
+
+        $signature = Get-AuthenticodeSignature $installerPath
+        if ($signature.Status -ne "Valid" -or
+            $signature.SignerCertificate.Subject -notmatch "NVIDIA") {
+            throw "The downloaded CUDA installer does not have a valid NVIDIA digital signature."
+        }
+
+        Write-Info "Running the CUDA installer silently. Approve the Windows administrator prompt if shown."
+        $process = Start-Process -FilePath $installerPath -ArgumentList @("-s", "-n") `
+            -Verb RunAs -Wait -PassThru
+        if ($process.ExitCode -notin @(0, 3010)) {
+            throw "CUDA $cudaVersion installer failed with exit code $($process.ExitCode)."
+        }
+        if ($process.ExitCode -eq 3010) {
+            Write-Warn "CUDA installed successfully, but Windows recommends a reboot."
+        }
+    } catch {
+        throw "Automatic CUDA $cudaVersion installation failed: $($_.Exception.Message)"
+    } finally {
+        if (Test-Path $installerPath) {
+            Remove-Item -LiteralPath $installerPath -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    Refresh-SystemPath
+}
+
+function Find-CMake {
+    $command = Get-Command cmake -ErrorAction SilentlyContinue
+    if ($command) {
+        return $command.Source
+    }
+
+    $candidates = @(
+        "$env:ProgramFiles\CMake\bin\cmake.exe",
+        "${env:ProgramFiles(x86)}\CMake\bin\cmake.exe",
+        "$env:ProgramFiles\Microsoft Visual Studio\2022\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe",
+        "$env:ProgramFiles\Microsoft Visual Studio\2022\Professional\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe",
+        "$env:ProgramFiles\Microsoft Visual Studio\2022\Enterprise\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe",
+        "$env:ProgramFiles\Microsoft Visual Studio\2022\BuildTools\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe"
+    )
+    return $candidates | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
+}
+
+function Get-CMakeVersion($cmakePath) {
+    if (-not $cmakePath) {
+        return $null
+    }
+    $firstLine = & $cmakePath --version | Select-Object -First 1
+    if ($firstLine -match "cmake version (\d+\.\d+\.\d+)") {
+        return [version]$Matches[1]
+    }
+    return $null
+}
+
+function Ensure-CMake {
+    $minimumVersion = [version]"3.24.0"
+    $cmakePath = Find-CMake
+    $cmakeVersion = Get-CMakeVersion $cmakePath
+
+    if ($cmakeVersion -and $cmakeVersion -ge $minimumVersion) {
+        $env:PATH = (Split-Path $cmakePath) + ";" + $env:PATH
+        Write-Ok "CMake $cmakeVersion is ready: $cmakePath"
+        return
+    }
+
+    if ($cmakeVersion) {
+        Write-Warn "CMake $cmakeVersion is too old. Version 3.24 or newer is required."
+    } else {
+        Write-Info "CMake 3.24 or newer was not found."
+    }
+
+    if (Get-Command winget -ErrorAction SilentlyContinue) {
+        Write-Header "Installing CMake (via winget)"
+        winget install --id Kitware.CMake --exact --silent --force `
+            --accept-source-agreements --accept-package-agreements
+        if ($LASTEXITCODE -ne 0) {
+            Write-Warn "Winget failed to install CMake (exit code $LASTEXITCODE)."
+        }
+        Refresh-SystemPath
+        $cmakePath = Find-CMake
+        $cmakeVersion = Get-CMakeVersion $cmakePath
+    }
+
+    if (-not $cmakeVersion -or $cmakeVersion -lt $minimumVersion) {
+        throw "CMake 3.24+ is required. Install it from https://cmake.org/download/ and rerun install.bat."
+    }
+
+    $env:PATH = (Split-Path $cmakePath) + ";" + $env:PATH
+    Write-Ok "CMake $cmakeVersion is ready: $cmakePath"
+}
+
 function Refresh-UvPath {
     $paths = @(
         "$env:USERPROFILE\.local\bin",
@@ -58,14 +249,23 @@ Write-Header "Checking UV"
 Ensure-Uv
 
 # -------------------------------------------------------
+# CMake
+# -------------------------------------------------------
+Write-Header "Checking CMake"
+Ensure-CMake
+
+# -------------------------------------------------------
 # Ninja (winget)
 # -------------------------------------------------------
 if (-not (Get-Command ninja -ErrorAction SilentlyContinue) -and (Get-Command winget -ErrorAction SilentlyContinue)) {
     Write-Header "Installing Ninja (via winget)"
     try {
         winget install --id Ninja-build.Ninja --exact --silent --accept-source-agreements --accept-package-agreements
+        if ($LASTEXITCODE -ne 0) {
+            throw "Winget exited with code $LASTEXITCODE."
+        }
         # Refresh Path for current session
-        $env:PATH = [System.Environment]::GetEnvironmentVariable("Path", "User") + ";" + [System.Environment]::GetEnvironmentVariable("Path", "Machine")
+        Refresh-SystemPath
         Refresh-UvPath
     } catch {
         Write-Warn "Winget failed to install Ninja. Please install it manually from https://ninja-build.org/"
@@ -96,6 +296,8 @@ $cudaExtra   = "cu128"
 $cudaIndex   = "https://download.pytorch.org/whl/cu128"
 $cudaNightly = $false
 $cudaLabel   = "unknown"
+$gpuComputeMajor = $null
+$gpuComputeMinor = $null
 
 try {
     $raw = & nvidia-smi --query-gpu=compute_cap --format=csv,noheader,nounits 2>$null
@@ -107,6 +309,8 @@ try {
     if ($sm -match "^(\d+)\.(\d+)$") {
         $major = [int]$Matches[1]
         $minor = [int]$Matches[2]
+        $gpuComputeMajor = $major
+        $gpuComputeMinor = $minor
 
         if ($major -ge 12) {
             $cudaExtra = "cu128"; $cudaIndex = "https://download.pytorch.org/whl/nightly/cu128"
@@ -117,9 +321,12 @@ try {
         } elseif ($major -eq 7 -and $minor -ge 5) {
             $cudaExtra = "cu128"; $cudaIndex = "https://download.pytorch.org/whl/cu128"
             $cudaNightly = $false; $cudaLabel = "Turing sm_$sm (cu128 stable)"
+        } elseif ($major -eq 6) {
+            $cudaExtra = "cu126"; $cudaIndex = "https://download.pytorch.org/whl/cu126"
+            $cudaNightly = $false; $cudaLabel = "Pascal sm_$sm (legacy CUDA 12.x)"
         } else {
             $cudaExtra = "cu126"; $cudaIndex = "https://download.pytorch.org/whl/cu126"
-            $cudaNightly = $false; $cudaLabel = "Volta sm_$sm (cu126 stable)"
+            $cudaNightly = $false; $cudaLabel = "Volta/legacy sm_$sm (CUDA 12.x)"
         }
     } else {
         Write-Warn "Could not parse compute capability '$sm'. Defaulting to cu128 stable."
@@ -184,66 +391,148 @@ if (-not $env:VULKAN_SDK -and -not (Test-Path "C:\VulkanSDK") -and (Get-Command 
 }
 
 # -------------------------------------------------------
-# Visual Studio 2022 (winget)
+# Visual Studio 2022 C++ toolchain
 # -------------------------------------------------------
-$vsBase = "C:\Program Files\Microsoft Visual Studio\2022"
-$vcvars = $null
-foreach ($edition in @("Community", "Professional", "Enterprise", "BuildTools")) {
-    $candidate = "$vsBase\$edition\VC\Auxiliary\Build\vcvars64.bat"
-    if (Test-Path $candidate) { $vcvars = $candidate; break }
-}
+$vcvars = Find-MsvcToolchain
 
 if (-not $vcvars -and (Get-Command winget -ErrorAction SilentlyContinue)) {
     Write-Header "Installing Visual Studio 2022 Community with C++ Workload (via winget)"
-    # Install VS Community with the Desktop C++ workload (Microsoft.VisualStudio.Workload.NativeDesktop)
-    winget install --id Microsoft.VisualStudio.2022.Community --override "--passive --config $PSScriptRoot\.vsconfig --add Microsoft.VisualStudio.Workload.NativeDesktop --includeRecommended" --accept-source-agreements --accept-package-agreements
-    
-    # Re-scan for vcvars64
-    foreach ($edition in @("Community", "Professional", "Enterprise", "BuildTools")) {
-        $candidate = "$vsBase\$edition\VC\Auxiliary\Build\vcvars64.bat"
-        if (Test-Path $candidate) { $vcvars = $candidate; break }
+    Write-Info "This is a multi-gigabyte installation and can take a while."
+    winget install --id Microsoft.VisualStudio.2022.Community --exact --force `
+        --override "--wait --passive --norestart --add Microsoft.VisualStudio.Workload.NativeDesktop --includeRecommended" `
+        --accept-source-agreements --accept-package-agreements
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warn "Automatic Visual Studio installation failed with exit code $LASTEXITCODE."
     }
+
+    $vcvars = Find-MsvcToolchain
 }
+
+if (-not $vcvars) {
+    Stop-MissingMsvc
+}
+Write-Ok "Verified Visual Studio 2022 C++ compiler via: $vcvars"
 
 # -------------------------------------------------------
 # CUDA Toolkit (winget)
 # -------------------------------------------------------
-if (-not $env:CUDA_PATH -and -not (Test-Path "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA") -and (Get-Command winget -ErrorAction SilentlyContinue)) {
-    Write-Header "Installing CUDA Toolkit (via winget)"
-    # Install CUDA 12.8 or latest available silently
-    winget install --id Nvidia.CUDA --exact --silent --accept-source-agreements --accept-package-agreements
+$requiresCuda12 = ($gpuComputeMajor -ne $null -and $gpuComputeMajor -lt 7) -or
+                  ($gpuComputeMajor -eq 7 -and $gpuComputeMinor -lt 5)
+
+# Prefer installed toolkits that can target the detected GPU. CUDA 13 removed
+# offline compilation and library support for pre-Turing architectures.
+$baseCUDA = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA"
+if (Test-Path $baseCUDA) {
+    $versions = Get-ChildItem $baseCUDA -Directory |
+        Where-Object { $_.Name -match "^v(\d+)\.(\d+)$" } |
+        ForEach-Object {
+            $versionMatch = [regex]::Match($_.Name, "^v(\d+)\.(\d+)$")
+            [PSCustomObject]@{
+                Path = $_.FullName
+                Version = [version]("$($versionMatch.Groups[1].Value).$($versionMatch.Groups[2].Value).0")
+            }
+        } |
+        Where-Object {
+            $_.Version -ge [version]"12.4.0" -and
+            (-not $requiresCuda12 -or $_.Version.Major -eq 12)
+        } |
+        Sort-Object Version -Descending
+    if ($versions) {
+        $cudaToolkitPath = $versions[0].Path
+    }
 }
 
-# 1. Try to find the path via 'nvcc' if it's in the PATH environment variable
+# Fallback to nvcc from PATH if it is compatible with the detected GPU.
 if (-not $cudaToolkitPath -and (Get-Command nvcc -ErrorAction SilentlyContinue)) {
     $nvccPath = (Get-Command nvcc).Source
     if ($nvccPath) {
-        # Go up from 'bin\nvcc.exe' to the toolkit root folder
-        $cudaToolkitPath = (Get-Item $nvccPath).Directory.Parent.FullName
+        $candidateToolkit = (Get-Item $nvccPath).Directory.Parent.FullName
+        $candidateOutput = & $nvccPath --version
+        $candidateRelease = $candidateOutput | Select-String "release (\d+\.\d+)"
+        if ($candidateRelease -and $candidateRelease.Matches.Count -gt 0) {
+            $candidateVersion = [version]($candidateRelease.Matches[0].Groups[1].Value + ".0")
+            if ($candidateVersion -ge [version]"12.4.0" -and
+                (-not $requiresCuda12 -or $candidateVersion.Major -eq 12)) {
+                $cudaToolkitPath = $candidateToolkit
+            }
+        }
     }
 }
 
-# 2. Fallback to standard Nvidia installation directory
-if (-not $cudaToolkitPath) {
-    $baseCUDA = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA"
-    if (Test-Path $baseCUDA) {
-        $versions = Get-ChildItem $baseCUDA -Directory | Where-Object { $_.Name -match "^v\d+\.\d+$" } | Sort-Object Name -Descending
-        if ($versions) { $cudaToolkitPath = $versions[0].FullName }
-    }
-}
-
-# 3. Check for specific versioned environment variables (e.g., CUDA_PATH_V12_4)
+# Check versioned environment variables (e.g., CUDA_PATH_V12_4).
 if (-not $cudaToolkitPath) {
     $envVars = Get-ChildItem Env: | Where-Object { $_.Name -match "^CUDA_PATH_V\d+_\d+$" } | Sort-Object Name -Descending
     foreach ($envVar in $envVars) {
-        if (Test-Path $envVar.Value) {
+        if ($envVar.Name -match "^CUDA_PATH_V(\d+)_(\d+)$") {
+            $envVersion = [version]("$($Matches[1]).$($Matches[2]).0")
+        } else {
+            continue
+        }
+        if ($envVersion -ge [version]"12.4.0" -and
+            (-not $requiresCuda12 -or $envVersion.Major -eq 12) -and
+            (Test-Path $envVar.Value)) {
             $cudaToolkitPath = $envVar.Value
             break
         }
     }
 }
 
-if (-not $cudaToolkitPath -and -not (Get-Command nvcc -ErrorAction SilentlyContinue)) {
+if (-not $cudaToolkitPath -and $requiresCuda12) {
+    Install-Cuda129ForLegacyGpu
+    $expectedCuda129 = Join-Path $baseCUDA "v12.9"
+    if (Test-Path (Join-Path $expectedCuda129 "bin\nvcc.exe")) {
+        $cudaToolkitPath = $expectedCuda129
+    }
+}
+
+if (-not $cudaToolkitPath -and -not $requiresCuda12 -and
+    (Get-Command winget -ErrorAction SilentlyContinue)) {
+    Write-Header "Installing current CUDA Toolkit (via winget)"
+    winget install --id Nvidia.CUDA --exact --silent `
+        --accept-source-agreements --accept-package-agreements
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warn "Automatic CUDA installation failed with exit code $LASTEXITCODE."
+    }
+
+    Refresh-SystemPath
+    if (Test-Path $baseCUDA) {
+        $latestCuda = Get-ChildItem $baseCUDA -Directory |
+            Where-Object { $_.Name -match "^v\d+\.\d+$" } |
+            Sort-Object {
+                $match = [regex]::Match($_.Name, "^v(\d+)\.(\d+)$")
+                [version]("$($match.Groups[1].Value).$($match.Groups[2].Value).0")
+            } -Descending |
+            Select-Object -First 1
+        if ($latestCuda -and (Test-Path (Join-Path $latestCuda.FullName "bin\nvcc.exe"))) {
+            $cudaToolkitPath = $latestCuda.FullName
+        }
+    }
+}
+
+$cudaVersion = $null
+if ($cudaToolkitPath -and (Test-Path (Join-Path $cudaToolkitPath "bin\nvcc.exe"))) {
+    $nvccVersionOutput = & (Join-Path $cudaToolkitPath "bin\nvcc.exe") --version
+    $releaseLine = $nvccVersionOutput | Select-String "release (\d+\.\d+)"
+    if ($releaseLine -and $releaseLine.Matches.Count -gt 0) {
+        $cudaVersion = [version]($releaseLine.Matches[0].Groups[1].Value + ".0")
+    }
+}
+
+if ($cudaToolkitPath -and (
+    -not $cudaVersion -or
+    $cudaVersion -lt [version]"12.4.0" -or
+    ($requiresCuda12 -and $cudaVersion.Major -ne 12)
+)) {
+    Write-Warn "The selected CUDA Toolkit is not compatible with this GPU and bundled ggml backend."
+    Write-Warn "Pascal/Volta require CUDA 12.4-12.9; Turing and newer require CUDA 12.4 or newer."
+    $cudaToolkitPath = $null
+}
+
+if ($requiresCuda12 -and -not $cudaToolkitPath) {
+    throw "CUDA 12.9.1 was not installed correctly. Pascal/Volta cannot be built with CUDA 13."
+}
+
+if (-not $cudaToolkitPath) {
     Write-Warn "CUDA Toolkit not detected."
     Write-Host "  S2.cpp requires:"
     Write-Host "    1. CUDA Toolkit  https://developer.nvidia.com/cuda-downloads"
@@ -251,73 +540,85 @@ if (-not $cudaToolkitPath -and -not (Get-Command nvcc -ErrorAction SilentlyConti
     Write-Host "    3. CUDA VS integration: (found in CUDA extras folder)"
     Write-Warn "Skipping S2.cpp CUDA backend. Defaulting to CPU only."
     $cudaArgs = ""
-} elseif (-not $vcvars) {
-    Write-Warn "Visual Studio 2022 not found. Cannot compile S2.cpp."
-    Write-Warn "Install VS2022 with 'Desktop development with C++' workload."
 } else {
-    Write-Ok "Found vcvars64.bat: $vcvars"
-    if ($cudaToolkitPath) { Write-Ok "Using CUDA Toolkit: $cudaToolkitPath" }
+    Write-Ok "Using CUDA Toolkit: $cudaToolkitPath"
+}
 
-    Push-Location "modules\s2.cpp"
-    try {
-        if ((Test-Path "build\s2.exe") -or (Test-Path "build\Release\s2.exe")) {
-            Write-Ok "S2.cpp is already compiled. Audited and skipped."
-        } else {
-            if (Test-Path "build") { Remove-Item -Recurse -Force "build" }
+Push-Location "modules\s2.cpp"
+try {
+    $s2Executable = Get-S2Executable
+    $needsBuild = Test-S2BuildNeeded $s2Executable
+    if (-not $needsBuild) {
+        Write-Ok "S2.cpp is already compiled: $s2Executable"
+    } else {
+        if ($s2Executable) {
+            Write-Info "S2.cpp sources changed. Rebuilding incrementally..."
+        }
+        if (-not (Test-Path "build")) {
             New-Item -ItemType Directory "build" | Out-Null
-            $buildDir = (Resolve-Path "build").Path
+        }
+        $buildDir = (Resolve-Path "build").Path
 
+        $cmakeCache = Join-Path $buildDir "CMakeCache.txt"
+        if (Test-Path $cmakeCache) {
+            $generatorArgs = ""
+            Write-Ok "Generator: existing CMake build directory"
+        } else {
             $useNinja = (Get-Command ninja -ErrorAction SilentlyContinue)
             if ($useNinja) {
-                $generator = "Ninja"
+                $generatorArgs = '-G "Ninja"'
                 Write-Ok "Generator: Ninja (Priority)"
             } else {
-                $generator = "Visual Studio 17 2022"
+                $generatorArgs = '-G "Visual Studio 17 2022"'
                 Write-Ok "Generator: Visual Studio 17 2022 (Fallback)"
             }
-
-            Write-Info "Configuring..."
-            # CUDA backend only supports F16/Q8_0 for get_rows.
-            # Vulkan backend supports ALL quantizations including k-quants.
-            # Enable both backends so the runtime picks the best one.
-            # Performance flags: /Ox (max opt), /arch:AVX2 (SIMD), /fp:fast, /GL /LTCG (Link Time Optimization), /openmp (Multithreading)
-            $cudaArgs = "-DS2_CUDA=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS=`"/Ox /arch:AVX2 /fp:fast /GL /DNDEBUG /openmp`" -DCMAKE_EXE_LINKER_FLAGS=`"/LTCG`" -DCMAKE_STATIC_LINKER_FLAGS=`"/LTCG`""
-            
-            # Check for Vulkan SDK
-            $vulkanSdk = $env:VULKAN_SDK
-            if (-not $vulkanSdk) {
-                # Try common install paths
-                $vulkanBase = "C:\VulkanSDK"
-                if (Test-Path $vulkanBase) {
-                    $versions = Get-ChildItem $vulkanBase -Directory | Sort-Object Name -Descending
-                    if ($versions) { $vulkanSdk = $versions[0].FullName }
-                }
-            }
-            if ($vulkanSdk -and (Test-Path $vulkanSdk)) {
-                Write-Ok "Vulkan SDK found: $vulkanSdk — enabling Vulkan backend (k-quants GPU support)"
-                $cudaArgs += " -DS2_VULKAN=ON"
-            } else {
-                Write-Warn "Vulkan SDK not found. K-quant models (Q2_K-Q6_K) will only run on CPU."
-                Write-Warn "Install Vulkan SDK from https://vulkan.lunarg.com/ for full GPU quant support."
-            }
-            
-            if ($cudaToolkitPath) { $cudaArgs += " -DCUDAToolkit_ROOT=`"$cudaToolkitPath`"" }
-            
-            cmd /c "`"$vcvars`" && cd `"$buildDir`" && cmake .. -G `"$generator`" $cudaArgs"
-            if ($LASTEXITCODE -ne 0) { throw "CMake configuration failed." }
-
-            Write-Info "Building..."
-            cmd /c "`"$vcvars`" && cd `"$buildDir`" && cmake --build . --config Release"
-            if ($LASTEXITCODE -ne 0) { throw "CMake build failed." }
-
-            Write-Ok "S2.cpp compiled successfully."
         }
-    } catch {
-        Write-Err $_.Exception.Message
-        Write-Warn "S2.cpp skipped - some features may be unavailable."
-    } finally {
-        Pop-Location
+
+        Write-Info "Configuring..."
+        # Performance flags: /Ox (max opt), /arch:AVX2 (SIMD), /fp:fast,
+        # /GL /LTCG (Link Time Optimization), /openmp (Multithreading)
+        $buildArgs = "-DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=ON -DGGML_OPENMP=ON -DGGML_CPU_REPACK=ON -DGGML_LTO=ON -DCMAKE_CXX_FLAGS=`"/Ox /arch:AVX2 /fp:fast /GL /DNDEBUG /openmp`" -DCMAKE_EXE_LINKER_FLAGS=`"/LTCG`" -DCMAKE_STATIC_LINKER_FLAGS=`"/LTCG`""
+        if ($cudaToolkitPath) {
+            $buildArgs += " -DS2_CUDA=ON -DCUDAToolkit_ROOT=`"$cudaToolkitPath`""
+        }
+            
+        # Check for Vulkan SDK
+        $vulkanSdk = $env:VULKAN_SDK
+        if (-not $vulkanSdk) {
+            $vulkanBase = "C:\VulkanSDK"
+            if (Test-Path $vulkanBase) {
+                $versions = Get-ChildItem $vulkanBase -Directory | Sort-Object Name -Descending
+                if ($versions) { $vulkanSdk = $versions[0].FullName }
+            }
+        }
+        if ($vulkanSdk -and (Test-Path $vulkanSdk)) {
+            Write-Ok "Vulkan SDK found: $vulkanSdk - enabling Vulkan backend (k-quants GPU support)"
+            $buildArgs += " -DS2_VULKAN=ON"
+        } else {
+            Write-Warn "Vulkan SDK not found. K-quant models (Q2_K-Q6_K) will only run on CPU."
+            Write-Warn "Install Vulkan SDK from https://vulkan.lunarg.com/ for full GPU quant support."
+        }
+            
+        cmd /d /s /c "call `"$vcvars`" && cd /d `"$buildDir`" && cmake .. $generatorArgs $buildArgs"
+        if ($LASTEXITCODE -ne 0) { throw "CMake configuration failed." }
+
+        Write-Info "Building..."
+        cmd /d /s /c "call `"$vcvars`" && cd /d `"$buildDir`" && cmake --build . --config Release"
+        if ($LASTEXITCODE -ne 0) { throw "CMake build failed." }
+
+        $s2Executable = Get-S2Executable
+        if (-not $s2Executable) {
+            $expected = Join-Path $PSScriptRoot "modules\s2.cpp\build\bin\Release\s2.exe"
+            throw "The build completed but s2.exe was not created. Expected output includes: $expected"
+        }
+        Write-Ok "S2.cpp compiled successfully."
     }
+    Write-Ok "s2.exe location: $s2Executable"
+} catch {
+    Write-Err $_.Exception.Message
+    throw
+} finally {
+    Pop-Location
 }
 
 # -------------------------------------------------------
