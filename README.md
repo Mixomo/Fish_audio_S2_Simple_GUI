@@ -10,6 +10,35 @@ A comprehensive, all-in-one Graphical User Interface (GUI) for **Fish Speech S2 
 
 <img src="./assets/train_tab.png">
 
+### 2026-06-13 - improve S2 build, CUDA handling, and audio playback stability
+
+* Added robust `s2.exe` discovery using configured and standard absolute paths, including `build\bin\Release\s2.exe`.
+* Replaced raw `FileNotFoundError` crashes with clear checked-path diagnostics.
+* Ensured `subprocess.Popen` uses the absolute `s2.exe` path and handles launch failures cleanly.
+* Improved `install.ps1` to validate VS2022 Native Desktop workload, `cl.exe`, Ninja, CMake >= 3.24, CUDA >= 12.4, and final `s2.exe` output.
+* Added installer fallback for CPU/Vulkan builds when CUDA is unavailable or incompatible.
+* Added Pascal/Volta CUDA 12.x selection logic and optional CUDA 12.9.1 installation flow.
+* Made `install.bat` propagate installer failures.
+* Added incremental recompilation when C++ sources change.
+* Switched Gradio playback output to temporary PCM16 dual-mono files to avoid Chrome/Gradio mono panning issues without modifying original samples.
+* Optimized CPU codec with AVX2/FMA/F16C, OpenMP, VQ projection parallelism, CPU repack, LTO, and configurable `S2_THREADS`.
+* Added experimental CUDA Reference Encoder support with UI checkbox and `--codec-cuda` CLI option.
+* Fixed CUDA IM2COL grid limit issue and added fallback for CUDA copy kernel failures.
+* Implemented hybrid codec mode: CUDA encoder with CPU decoder for stable faster reference encoding.
+* Improved PyTorch cleanup when switching engines and made Clear VRAM unload model, codec, compiled functions, RAM, and VRAM references.
+* Updated UI behavior for CUDA Reference Encoder and Silence between speakers controls.
+* Fixed slider layout stability and prevented visual UI events from using `/queue/join`.
+* Filtered only the obsolete Starlette warning while keeping real 422 errors visible.
+
+**Validation:**
+
+* Python and PowerShell syntax validated.
+* Paths with spaces validated.
+* Configured-path precedence and existing `s2.exe` discovery validated.
+* `vswhere`, MSVC detection, Ninja, CMake 4.3.1, and CUDA selection logic validated.
+* Real synthesis validated locally with RTX 3090 and Q8: model on CUDA, codec on CPU/hybrid path, correct generation.
+* Full multi-GB Visual Studio/CUDA installer flows were not rerun to avoid modifying the current system.
+
 ### 2026-04-24 - Add Dialogue Builder - Multi Speaker Support Inference
 We've introduced a **Dialogue Builder** sub-tab within the Voice Clone interface, designed for creating multi-speaker interactions easily:
 
