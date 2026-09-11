@@ -19,6 +19,7 @@ struct GenerateParams {
     int32_t min_tokens_before_end   = 0;
     int32_t n_threads               = 4;
     bool    verbose                 = true;
+    int32_t seed                    = 0;
 };
 
 struct GenerateResult {

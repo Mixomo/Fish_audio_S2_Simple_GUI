@@ -1,6 +1,7 @@
 import gradio as gr
 import importlib.util
 import os
+import random
 import subprocess
 import time
 import warnings
@@ -122,6 +123,33 @@ def play_done_chime():
     else:
         # Fallback to system beep if file is missing
         winsound.MessageBeep()
+
+
+def normalize_seed(seed_value):
+    if seed_value is None or seed_value == "":
+        return None
+    try:
+        seed = int(seed_value)
+    except (TypeError, ValueError):
+        return None
+    if seed == 0:
+        return None
+    if seed < 0:
+        seed = abs(seed)
+    if seed > (1 << 31):
+        seed = 1 << 31
+    return seed
+
+
+def resolve_seed_for_generation(seed_value):
+    normalized_seed = normalize_seed(seed_value)
+    if normalized_seed is None:
+        normalized_seed = random_seed_value()
+    return normalized_seed
+
+
+def random_seed_value():
+    return random.randint(1, (1 << 31) - 1)
 
 # Main Paths
 TOKENIZER_PATH = os.path.join(ROOT_DIR, "modules", "s2.cpp", "tokenizer.json")
@@ -363,9 +391,27 @@ def load_sample(sample_name):
 
 # --- Helper functions ---
 
-def generate_fish_python(text, ref_audio, ref_text, top_p, top_k, temp, rep_pen, split_by_paragraph, model_select, progress):
+def generate_fish_python(text, ref_audio, ref_text, top_p, top_k, temp, rep_pen, split_by_paragraph, model_select, seed, progress):
     global fish_python_model, fish_python_codec, fish_python_decode_one_token, fish_python_checkpoint_dir
     from pathlib import Path
+
+    normalized_seed = resolve_seed_for_generation(seed)
+    if normalized_seed is not None:
+        try:
+            from fish_speech.utils import set_seed
+            set_seed(normalized_seed)
+            print(f"[Seed] Applied PyTorch seed: {normalized_seed}")
+        except Exception as exc:
+            print(f"[Seed] Failed to set seed: {exc}")
+
+    def force_seed_for_generation(target_seed):
+        if target_seed is None:
+            return
+        try:
+            from fish_speech.utils import set_seed
+            set_seed(target_seed)
+        except Exception:
+            pass
     
     target_dir = os.path.join(TRAINED_MODELS_DIR, model_select) if model_select and model_select != "Base Model (Fish S2 Pro)" else FISH_MODELS_DIR
         
@@ -489,6 +535,7 @@ def generate_fish_python(text, ref_audio, ref_text, top_p, top_k, temp, rep_pen,
             for idx, para in enumerate(paragraphs):
                 progress_pct = 0.7 + (idx / len(paragraphs)) * 0.25
                 progress(progress_pct, desc=f"Generating paragraph {idx + 1}/{len(paragraphs)}...")
+                force_seed_for_generation(normalized_seed)
                 
                 para_generator = generate_long(
                     model=fish_python_model,
@@ -537,6 +584,7 @@ def generate_fish_python(text, ref_audio, ref_text, top_p, top_k, temp, rep_pen,
         else:
             # Single paragraph or original logic
             progress(0.8, desc="Generating voice...")
+            force_seed_for_generation(normalized_seed)
             generator = generate_long(
                 model=fish_python_model,
                 device=device,
@@ -602,13 +650,15 @@ def write_synthesized_audio(path, audio_data, sample_rate):
     sf.write(path, dual_mono, sample_rate, subtype="PCM_16")
 
 
-def clone_voice(engine, cpp_model_str, codec_cuda, trained_model_select, text, ref_audio, ref_text, top_p, top_k, temp, rep_pen, split_by_paragraph, progress=gr.Progress()):
+def clone_voice(engine, cpp_model_str, codec_cuda, trained_model_select, text, ref_audio, ref_text, top_p, top_k, temp, rep_pen, split_by_paragraph, seed, progress=gr.Progress()):
     global s2_process, s2_current_model, s2_current_codec_cuda
 
+    normalized_seed = resolve_seed_for_generation(seed)
+
     if not text:
-        return None, "Please enter some text to synthesize."
+        return None, "Please enter some text to synthesize.", normalized_seed
     if not ref_audio:
-        return None, "Please upload a reference audio."
+        return None, "Please upload a reference audio.", normalized_seed
         
     timestamp = int(time.time() * 1000)
     out_wav = os.path.join(OUTPUTS_DIR, f"output_{timestamp}.wav")
@@ -619,7 +669,7 @@ def clone_voice(engine, cpp_model_str, codec_cuda, trained_model_select, text, r
     if engine == ENGINE_CPP:
         cpp_exec, checked_paths = find_s2_executable()
         if not cpp_exec:
-            return None, format_s2_not_found_error(checked_paths)
+            return None, format_s2_not_found_error(checked_paths), normalized_seed
 
         # Auto-Unload PyTorch if switching to CPP
         if fish_python_model is not None:
@@ -630,7 +680,7 @@ def clone_voice(engine, cpp_model_str, codec_cuda, trained_model_select, text, r
         
         filename = GGUF_MODELS.get(cpp_model_str)
         if not filename:
-             return None, "Invalid GGUF model selected."
+             return None, "Invalid GGUF model selected.", normalized_seed
         
         progress(0.2, desc=f"Checking GGUF model: {filename}")
         print(f"Checking/Downloading {filename}...")
@@ -642,7 +692,7 @@ def clone_voice(engine, cpp_model_str, codec_cuda, trained_model_select, text, r
                 local_dir_use_symlinks=False
             )
         except Exception as e:
-            return None, f"Failed to download GGUF model: {e}"
+            return None, f"Failed to download GGUF model: {e}", normalized_seed
         
         # Start server if not running with the same model
         if (
@@ -734,7 +784,7 @@ def clone_voice(engine, cpp_model_str, codec_cuda, trained_model_select, text, r
                 return None, (
                     f"Failed to start s2.exe:\n{cpp_exec}\n\n"
                     f"Windows reported: {e}"
-                )
+                ), normalized_seed
             s2_current_model = filename
             s2_current_codec_cuda = codec_cuda
             
@@ -785,7 +835,7 @@ def clone_voice(engine, cpp_model_str, codec_cuda, trained_model_select, text, r
                     s2_process = None
                     s2_current_model = None
                     s2_current_codec_cuda = False
-                    return None, f"Fish CPP Engine crashed during startup.\n\nErrors:\n{last_msg}"
+                    return None, f"Fish CPP Engine crashed during startup.\n\nErrors:\n{last_msg}", normalized_seed
 
                 # Health-check the HTTP endpoint
                 try:
@@ -798,7 +848,7 @@ def clone_voice(engine, cpp_model_str, codec_cuda, trained_model_select, text, r
                 time.sleep(0.5)
 
             if not ready:
-                return None, "Fish CPP server timed out during startup."
+                return None, "Fish CPP server timed out during startup.", normalized_seed
             
             # Extra wait: server binds port before model is fully loaded into VRAM
             time.sleep(2)
@@ -827,7 +877,7 @@ def clone_voice(engine, cpp_model_str, codec_cuda, trained_model_select, text, r
                             data = {
                                 'text': para,
                                 'ref_text': ref_text,
-                                'params': json.dumps({'max_new_tokens': para_tokens, 'temperature': temp, 'top_p': top_p, 'top_k': top_k, 'repetition_penalty': rep_pen, 'verbose': True})
+                                'params': json.dumps({'max_new_tokens': para_tokens, 'temperature': temp, 'top_p': top_p, 'top_k': top_k, 'repetition_penalty': rep_pen, 'verbose': True, 'seed': normalized_seed})
                             }
                             res = requests.post("http://localhost:3030/generate", data=data, files=files, timeout=600)
                             res.raise_for_status()
@@ -849,7 +899,7 @@ def clone_voice(engine, cpp_model_str, codec_cuda, trained_model_select, text, r
                         time.sleep(1)
                 
                 if current_audio is None:
-                    return None, f"Failed to generate paragraph {idx+1} after multiple attempts."
+                    return None, f"Failed to generate paragraph {idx+1} after multiple attempts.", normalized_seed
             
             # Concatenate all segments
             if all_audio_segments:
@@ -863,9 +913,9 @@ def clone_voice(engine, cpp_model_str, codec_cuda, trained_model_select, text, r
                 
                 play_done_chime()
                 progress(1.0, desc="Done!")
-                return out_wav, "Synthesis completed successfully (multi-paragraph)!"
+                return out_wav, "Synthesis completed successfully (multi-paragraph)!", normalized_seed
             else:
-                return None, "No audio segments were generated correctly."
+                return None, "No audio segments were generated correctly.", normalized_seed
 
         # --- Standard Single-Pass Logic (Used if 1 paragraph or split disabled) ---
         # Retry loop: server may reset connections while finishing VRAM allocation
@@ -878,7 +928,7 @@ def clone_voice(engine, cpp_model_str, codec_cuda, trained_model_select, text, r
                     data = {
                         'text': text,
                         'ref_text': ref_text,
-                        'params': json.dumps({'max_new_tokens': expected_new_tokens, 'temperature': temp, 'top_p': top_p, 'top_k': top_k, 'repetition_penalty': rep_pen, 'verbose': True})
+                        'params': json.dumps({'max_new_tokens': expected_new_tokens, 'temperature': temp, 'top_p': top_p, 'top_k': top_k, 'repetition_penalty': rep_pen, 'verbose': True, 'seed': normalized_seed})
                     }
                     res = requests.post("http://localhost:3030/generate", data=data, files=files, timeout=600)
                     res.raise_for_status()
@@ -893,7 +943,7 @@ def clone_voice(engine, cpp_model_str, codec_cuda, trained_model_select, text, r
                 gc.collect()
                 play_done_chime()
                 progress(1.0, desc="Done!")
-                return out_wav, "Synthesis completed successfully!"
+                return out_wav, "Synthesis completed successfully!", normalized_seed
             except (ConnectionError, requests.exceptions.ConnectionError) as e:
                 last_error = e
                 if attempt < max_retries - 1:
@@ -915,7 +965,7 @@ def clone_voice(engine, cpp_model_str, codec_cuda, trained_model_select, text, r
             last_logs = "\n".join(crash_logs[-10:])
             error_msg = f"Crash Detected (Exit code {s2_process.returncode}).\nLogs:\n{last_logs}\n\nOriginal Error: {error_msg}"
             
-        return None, f"s2.cpp REST API Error:\n{error_msg}"
+        return None, f"s2.cpp REST API Error:\n{error_msg}", normalized_seed
             
     elif engine == ENGINE_PYTORCH:
         # Auto-Unload CPP Server if switching to PyTorch
@@ -939,7 +989,7 @@ def clone_voice(engine, cpp_model_str, codec_cuda, trained_model_select, text, r
                 progress(0.05, desc="[First Run] Compiling CUDA kernels... up to 5 min. See console.")
                 print("[Fish Speech] NOTICE: torch.compile is building kernels for the first time. This may take up to 5 minutes.")
                 print("[Fish Speech] Subsequent generations will be significantly faster.")
-            sr, audio_int16 = generate_fish_python(text, ref_audio, ref_text, top_p, top_k, temp, rep_pen, split_by_paragraph, trained_model_select, progress)
+            sr, audio_int16 = generate_fish_python(text, ref_audio, ref_text, top_p, top_k, temp, rep_pen, split_by_paragraph, trained_model_select, seed, progress)
             
             # Convert to float32 to process, then back
             audio_data = audio_int16.astype(np.float32) / 32767.0
@@ -952,15 +1002,15 @@ def clone_voice(engine, cpp_model_str, codec_cuda, trained_model_select, text, r
             gc.collect()
             torch.cuda.empty_cache()
             
-            return out_wav, "Synthesis completed."
+            return out_wav, "Synthesis completed.", normalized_seed
         except Exception as e:
             import traceback
             traceback.print_exc()
-            return None, f"Error generating with PyTorch: {str(e)}"
+            return None, f"Error generating with PyTorch: {str(e)}", normalized_seed
 
-    return None, "Engine not supported."
+    return None, "Engine not supported.", normalized_seed
 
-def generate_dialogue(engine, cpp_model_str, codec_cuda, trained_model_select, top_p, top_k, temp, rep_pen, split_para, row_count, silence_duration, *args, progress=gr.Progress()):
+def generate_dialogue(engine, cpp_model_str, codec_cuda, trained_model_select, top_p, top_k, temp, rep_pen, split_para, seed, row_count, silence_duration, *args, progress=gr.Progress()):
     # args is [sample1, ..., sample20, text1, ..., text20]
     num_max = 20 # Should match MAX_DIALOGUE_SEGMENTS
     samples = args[:num_max]
@@ -974,7 +1024,7 @@ def generate_dialogue(engine, cpp_model_str, codec_cuda, trained_model_select, t
             segments.append((s, t))
             
     if not segments:
-        return None, "Please add at least one speaker and text."
+        return None, "Please add at least one speaker and text.", normalize_seed(seed)
         
     all_audio_segments = []
     final_sr = 32000
@@ -989,9 +1039,9 @@ def generate_dialogue(engine, cpp_model_str, codec_cuda, trained_model_select, t
             continue
             
         # Generate
-        wav_path, status = clone_voice(
+        wav_path, status, _ = clone_voice(
             engine, cpp_model_str, codec_cuda, trained_model_select, text, ref_audio, ref_text,
-            top_p, top_k, temp, rep_pen, split_para, progress=progress
+            top_p, top_k, temp, rep_pen, split_para, seed, progress=progress
         )
         
         if wav_path and os.path.exists(wav_path):
@@ -1006,7 +1056,7 @@ def generate_dialogue(engine, cpp_model_str, codec_cuda, trained_model_select, t
                 silence = np.zeros(int(sr * silence_duration), dtype=np.float32)
                 all_audio_segments.append(silence)
         else:
-            return None, f"Error in segment {i+1} ({sample_name}): {status}"
+            return None, f"Error in segment {i+1} ({sample_name}): {status}", normalize_seed(seed)
             
     if all_audio_segments:
         # Concatenate (exclude last silence if added)
@@ -1020,9 +1070,9 @@ def generate_dialogue(engine, cpp_model_str, codec_cuda, trained_model_select, t
         # Output file
         out_wav = os.path.join(OUTPUTS_DIR, f"dialogue_{int(time.time()*1000)}.wav")
         write_synthesized_audio(out_wav, combined, final_sr)
-        return out_wav, f"Dialogue generated successfully with {len(segments)} segments!"
+        return out_wav, f"Dialogue generated successfully with {len(segments)} segments!", normalize_seed(seed)
     
-    return None, "No audio generated."
+    return None, "No audio generated.", normalize_seed(seed)
 
 def transcribe_only(audio_path, model_size, language_name, progress=gr.Progress()):
     if not audio_path:
@@ -1846,6 +1896,19 @@ with gr.Blocks(title="Fish Speech S2 Pro - Voice Clone & Training GUI") as app:
                         with gr.Column():
                             temperature_slider = gr.Slider(0.1, 2.0, value=0.7, step=0.1, label="Temperature")
                             rep_pen_slider = gr.Slider(1.0, 2.0, value=1.2, step=0.05, label="Repetition Penalty")
+
+                    with gr.Row():
+                        last_seed_state = gr.State(value=0)
+                        seed_input = gr.Number(
+                            label="Seed",
+                            value=0,
+                            precision=0,
+                            minimum=0,
+                            maximum=(1 << 31) - 1,
+                            info="0 = random, any other value reproduces the same output."
+                        )
+                        seed_reuse_btn = gr.Button("Reuse Last Seed", size="sm")
+                        seed_random_btn = gr.Button("Random Seed", size="sm")
                     
                     with gr.Row():
                         with gr.Column():
@@ -2095,10 +2158,72 @@ with gr.Blocks(title="Fish Speech S2 Pro - Voice Clone & Training GUI") as app:
                         show_progress="hidden",
                     )
 
+                    def apply_last_seed(last_seed_value):
+                        value = normalize_seed(last_seed_value)
+                        if value is None:
+                            value = 0
+                        return value, value
+
+                    def apply_random_seed():
+                        value = random_seed_value()
+                        return value, value
+
+                    def run_single_generation(engine_dropdown_value, cpp_model_value, codec_cuda_value, trained_model_value, text_value, ref_audio_value, ref_text_value, top_p_value, top_k_value, temp_value, rep_pen_value, split_by_paragraph_value, seed_value):
+                        chosen_seed = resolve_seed_for_generation(seed_value)
+                        wav_path, status, _ = clone_voice(
+                            engine_dropdown_value,
+                            cpp_model_value,
+                            codec_cuda_value,
+                            trained_model_value,
+                            text_value,
+                            ref_audio_value,
+                            ref_text_value,
+                            top_p_value,
+                            top_k_value,
+                            temp_value,
+                            rep_pen_value,
+                            split_by_paragraph_value,
+                            chosen_seed,
+                        )
+                        return wav_path, status, chosen_seed, chosen_seed
+
+                    def run_dialogue_generation(engine_dropdown_value, cpp_model_value, codec_cuda_value, trained_model_value, top_p_value, top_k_value, temp_value, rep_pen_value, split_by_paragraph_value, seed_value, row_count_value, silence_duration_value, *args):
+                        chosen_seed = resolve_seed_for_generation(seed_value)
+                        wav_path, status, _ = generate_dialogue(
+                            engine_dropdown_value,
+                            cpp_model_value,
+                            codec_cuda_value,
+                            trained_model_value,
+                            top_p_value,
+                            top_k_value,
+                            temp_value,
+                            rep_pen_value,
+                            split_by_paragraph_value,
+                            chosen_seed,
+                            row_count_value,
+                            silence_duration_value,
+                            *args,
+                        )
+                        return wav_path, status, chosen_seed, chosen_seed
+
+                    seed_reuse_btn.click(
+                        fn=apply_last_seed,
+                        inputs=[last_seed_state],
+                        outputs=[seed_input, last_seed_state],
+                        queue=False,
+                    )
+
+                    seed_random_btn.click(
+                        fn=apply_random_seed,
+                        inputs=[],
+                        outputs=[seed_input, last_seed_state],
+                        queue=False,
+                    )
+
                     generate_btn.click(
-                        fn=clone_voice,
-                        inputs=[engine_dropdown, cpp_model_dropdown, codec_cuda_check, trained_model_dropdown, target_text, vc_sample_audio, vc_sample_text, top_p_slider, top_k_slider, temperature_slider, rep_pen_slider, split_para_check],
-                        outputs=[output_audio, clone_status]
+                        fn=run_single_generation,
+                        inputs=[engine_dropdown, cpp_model_dropdown, codec_cuda_check, trained_model_dropdown, target_text, vc_sample_audio, vc_sample_text, top_p_slider, top_k_slider, temperature_slider, rep_pen_slider, split_para_check, seed_input],
+                        outputs=[output_audio, clone_status, seed_input, last_seed_state]
                     )
 
                     # Dialogue Builder Handlers
@@ -2124,15 +2249,15 @@ with gr.Blocks(title="Fish Speech S2 Pro - Voice Clone & Training GUI") as app:
                         )
 
                     generate_dialogue_btn.click(
-                        fn=generate_dialogue,
+                        fn=run_dialogue_generation,
                         inputs=[
                             engine_dropdown, cpp_model_dropdown, codec_cuda_check, trained_model_dropdown,
                             top_p_slider, top_k_slider, temperature_slider, rep_pen_slider, split_para_check,
-                            dialogue_row_count, dialogue_silence_slider,
+                            seed_input, dialogue_row_count, dialogue_silence_slider,
                             *all_samples_ui,
                             *all_texts_ui
                         ],
-                        outputs=[dialogue_output_audio, dialogue_status]
+                        outputs=[dialogue_output_audio, dialogue_status, seed_input, last_seed_state]
                     )
 
                     # 3. Sample Selection & Management

@@ -126,6 +126,11 @@ namespace s2
                             bool val = j["verbose"].get<bool>();
                             pipelineParams.gen.verbose = val;
                         }
+
+                        if (j.contains("seed")) {
+                            int32_t val = j["seed"].get<int32_t>();
+                            pipelineParams.gen.seed = std::max(0, val);
+                        }
                     }
                     catch (const json::parse_error& e) {
                         json err = { {"error", "JSON parse error"} };

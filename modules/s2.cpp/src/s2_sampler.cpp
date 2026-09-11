@@ -42,6 +42,10 @@ static std::vector<float> softmax_from_sorted_logits(const std::vector<std::pair
 int32_t sample_token(const float * logits, int32_t vocab_size, const SamplerParams & params) {
     if (vocab_size <= 0) return 0;
 
+    std::mt19937 gen = params.seed > 0
+        ? std::mt19937(static_cast<uint32_t>(params.seed))
+        : std::mt19937(std::random_device{}());
+
     std::vector<std::pair<float, int32_t>> items;
     items.reserve(vocab_size);
     for (int32_t i = 0; i < vocab_size; ++i) {
@@ -91,7 +95,6 @@ int32_t sample_token(const float * logits, int32_t vocab_size, const SamplerPara
     }
     for (float & p : probs) p /= sum_p;
 
-    thread_local static std::mt19937 gen(std::random_device{}());
     std::discrete_distribution<int32_t> dist(probs.begin(), probs.end());
 
     const int32_t sampled_idx = dist(gen);

@@ -68,6 +68,7 @@ GenerateResult generate(
         sparams.temperature     = params.temperature;
         sparams.top_p           = params.top_p;
         sparams.top_k           = params.top_k;
+        sparams.seed            = params.seed;
         return sample_token(biased.data(), vocab_size, sparams);
     };
 
@@ -85,6 +86,7 @@ GenerateResult generate(
     sparams.temperature     = params.temperature;
     sparams.top_p           = params.top_p;
     sparams.top_k           = params.top_k;
+    sparams.seed            = params.seed;
 
     // RAS state
     std::vector<int32_t> ras_window;
@@ -115,6 +117,7 @@ GenerateResult generate(
             ras_sparams.temperature = ras_high_temp;
             ras_sparams.top_p       = ras_high_top_p;
             ras_sparams.top_k       = params.top_k;
+            ras_sparams.seed        = params.seed;
             main_token = sample_token(biased.data(), vocab_size, ras_sparams);
         }
 
