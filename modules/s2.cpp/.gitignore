@@ -1,0 +1,10 @@
+build/
+*.gguf
+*.wav
+*.mp3
+*.o
+*.a
+*.so
+*.d
+compile_commands.json
+.cache/

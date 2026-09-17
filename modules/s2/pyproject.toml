@@ -1,0 +1,67 @@
+[project]
+name = "fish-speech"
+version = "2.0.0"
+authors = [
+    {name = "Fish Audio", email = "oss@fish.audio"},
+]
+description = "Fish Speech (Optimized GPU Build)"
+readme = "README.md"
+requires-python = ">=3.10"
+keywords = ["TTS", "Speech", "GPU"]
+license = {text = "Fish Audio Research License"}
+classifiers = [
+    "Programming Language :: Python :: 3",
+]
+dependencies = [
+    "numpy",
+    "torch>=2.1.0",
+    "torchaudio>=2.1.0",
+    "transformers",
+    "datasets",
+    "lightning",
+    "hydra-core",
+    "tensorboard",
+    "natsort",
+    "einops",
+    "librosa",
+    "rich",
+    "gradio",
+    "wandb",
+    "grpcio",
+    "kui",
+    "uvicorn",
+    "loguru",
+    "loralib",
+    "pyrootutils",
+    "resampy",
+    "einx==0.2.2",
+    "zstandard",
+    "pydub",
+    "pyaudio",
+    "modelscope",
+    "opencc-python-reimplemented",
+    "silero-vad",
+    "ormsgpack",
+    "tiktoken",
+    "pydantic",
+    "cachetools",
+    "descript-audio-codec",
+    "safetensors",
+    "google-genai",
+    "deepgram-sdk",
+    "soundfile"
+]
+
+[project.optional-dependencies]
+preprocess = [
+    "pyannote.audio",
+    "click",
+    "fastapi",
+]
+
+[build-system]
+requires = ["setuptools", "setuptools-scm"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["fish_speech", "tools"]

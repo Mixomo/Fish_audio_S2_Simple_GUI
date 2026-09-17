@@ -1,0 +1,88 @@
+# Fish Audio S2 Simple GUI
+# Publish source code, documentation, installers, presets and reusable assets.
+# Exclude only local environments, downloaded data, generated results and builds.
+
+# Python bytecode and test/tool caches
+__pycache__/
+*.py[cod]
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pytype/
+.tox/
+.nox/
+.hypothesis/
+.coverage
+.coverage.*
+htmlcov/
+
+# Local environments, runtime state and caches
+/.venv/
+/.runtime/
+/.cache/
+**/.venv/
+**/.runtime/
+**/.cache/
+.env
+.env.*
+!.env.example
+
+# Local logs and temporary files
+/logs/
+**/logs/
+*.log
+*.tmp
+*.temp
+*.part
+*.bak
+
+# User data and generated audio/model state
+/datasets/
+/models/
+/outputs/
+/projects/
+/samples/
+
+# Training and inference artifacts generated inside the Fish-Speech module
+/modules/s2/results/
+/modules/s2/checkpoints/
+/modules/s2/outputs/
+/modules/s2/data/
+/modules/s2/.hydra/
+/modules/s2/fish_speech/configs/lora/run_*.yaml
+
+# Native/Python build products
+build/
+dist/
+*.egg-info/
+
+# CMake/Ninja and compiled C/C++ artifacts
+/modules/s2.cpp/build/
+**/CMakeFiles/
+**/CMakeCache.txt
+**/cmake_install.cmake
+**/compile_commands.json
+*.o
+*.obj
+*.a
+*.lib
+*.exp
+*.pdb
+*.ilk
+*.idb
+*.ipdb
+*.iobj
+
+# Frontend dependencies and generated bundles
+/modules/s2/awesome_webui/node_modules/
+/modules/s2/awesome_webui/dist/
+/modules/s2/awesome_webui/.vite/
+
+# Local IDE and operating-system files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+Desktop.ini
+
